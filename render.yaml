@@ -1,0 +1,24 @@
+# OPTIONAL. You are deploying manually as a Web Service via the Render
+# dashboard, so you do NOT need this file. It's here only if you ever want
+# Render's "Blueprint" one-click deploy. (Fixed: no rootDir — main.py is at
+# the repo root, not in a backend/ subfolder.)
+services:
+  - type: web
+    name: gift-trove-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: STRING_SESSION
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: GETGEMS_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
