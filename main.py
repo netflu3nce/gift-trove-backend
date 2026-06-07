@@ -134,8 +134,8 @@ async def _register_bot_handlers():
     async def _start(event):
         try:
             buttons = [
-                [Button.url("🎁 Open GiftTrove", MINIAPP_URL)],
-                [Button.url("💬 Join Community", COMMUNITY_URL)],
+                [Button.url(" Open GiftTrove", MINIAPP_URL)],
+                [Button.url(" Join Community", COMMUNITY_URL)],
             ]
             await event.respond(WELCOME_TEXT, file=WELCOME_IMAGE, buttons=buttons)
         except Exception as e:
