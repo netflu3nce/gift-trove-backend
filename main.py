@@ -20,9 +20,16 @@ log = logging.getLogger("gifttrove")
 try:
     from telethon import TelegramClient, functions, types  # noqa: F401
     from telethon.sessions import StringSession
+    try:
+        from telethon.errors import FloodWaitError
+    except Exception:
+        class FloodWaitError(Exception):
+            seconds = 0
     TELETHON_OK = True
 except Exception as e:  # pragma: no cover
     TELETHON_OK = False
+    class FloodWaitError(Exception):
+        seconds = 0
     log.error("Telethon import failed (%s). Install with: pip install -U telethon", e)
 
 try:
@@ -62,6 +69,7 @@ FEATURED_NAMES = [n.strip() for n in os.getenv(
 # ─── Tiny TTL cache + a lock to serialise MTProto calls ───────────────────────
 _cache = {}
 _mtproto_lock = asyncio.Lock()
+_featured_lock = asyncio.Lock()
 
 
 def cache_get(key):
@@ -135,6 +143,8 @@ async def _connect_user_session():
     try:
         if client is None:
             client = TelegramClient(StringSession(STRING_SESSION), int(API_ID), API_HASH)
+            # Auto-sleep only for short waits; longer floods raise (we catch them)
+            client.flood_sleep_threshold = 5
         if not client.is_connected():
             await asyncio.wait_for(client.connect(), timeout=20)
         if not await client.is_user_authorized():
@@ -253,9 +263,14 @@ async def _invoke(build, timeout=None):
                 if not client.is_connected():
                     await asyncio.wait_for(client.connect(), timeout=15)
                 return await asyncio.wait_for(client(build()), timeout=timeout)
+            except FloodWaitError as e:
+                # Rate-limited by Telegram. Reconnecting won't help — bail out
+                # so the handler can serve cache / empty instead of cascading.
+                log.warning("flood wait %ss on MTProto call — skipping", getattr(e, "seconds", "?"))
+                raise
             except Exception as e:
                 last = e
-                log.error("MTProto invoke attempt %d failed: %s", attempt, e)
+                log.error("MTProto invoke attempt %d failed: %s", attempt, repr(e))
                 if attempt == 1:
                     try:
                         await client.disconnect()
@@ -264,7 +279,7 @@ async def _invoke(build, timeout=None):
                     try:
                         await asyncio.wait_for(client.connect(), timeout=15)
                     except Exception as e2:
-                        log.error("reconnect failed: %s", e2)
+                        log.error("reconnect failed: %s", repr(e2))
     raise last if last else RuntimeError("MTProto invoke failed")
 
 
@@ -299,23 +314,36 @@ def _slug_from_title(title):
 
 
 def _extract_price(g):
-    for attr in ("resell_amount", "resale_amount", "value_amount"):
-        v = getattr(g, attr, None)
-        if v is not None:
-            amount = getattr(v, "amount", None)
-            nanos = getattr(v, "nanos", 0) or 0
-            if amount is not None:
-                try:
-                    return (round(float(amount) + float(nanos) / 1e9, 4), "TON")
-                except Exception:
-                    pass
-            if isinstance(v, (int, float)):
-                return (round(float(v) / 1e9, 4), "TON")
-    for attr in ("resell_stars", "resale_stars"):
-        v = getattr(g, attr, None)
-        if isinstance(v, (int, float)) and v:
-            return (int(v), "Stars")
-    return (None, "TON")
+    """
+    Resale price. `resell_amount` is a Vector<StarsAmount> that may contain:
+      • starsAmount     -> Stars   (amount = whole stars, nanos = billionths)
+      • starsTonAmount  -> GRAM/TON (amount = nanotons, 1e9 per coin)
+    Telegram resale is natively in Stars, so we prefer Stars and fall back to
+    GRAM for TON-only listings.
+    """
+    stars = None
+    gram = None
+    amounts = getattr(g, "resell_amount", None)
+    if amounts is None:
+        amounts = []
+    if not isinstance(amounts, (list, tuple)):
+        amounts = [amounts]
+    for a in amounts:
+        amt = getattr(a, "amount", None)
+        if amt is None:
+            continue
+        cls = type(a).__name__
+        if "Ton" in cls:  # StarsTonAmount -> GRAM (nanotons)
+            gram = round(int(amt) / 1e9, 4)
+        else:             # StarsAmount -> Stars
+            nanos = getattr(a, "nanos", 0) or 0
+            val = int(amt) + (int(nanos) / 1e9)
+            stars = int(val) if float(val).is_integer() else round(val, 2)
+    if stars is not None:
+        return (stars, "Stars")
+    if gram is not None:
+        return (gram, "GRAM")
+    return (None, "Stars")
 
 
 def _gift_attrs(g):
@@ -530,7 +558,7 @@ async def collections():
                 "preview": "",
             })
         out = [c for c in out if c["gift_id"]]
-        cache_set("collections", out, ttl=600)
+        cache_set("collections", out, ttl=900)
         return {"collections": out, "_raw_count": len(raw)}
     except Exception as e:
         log.error("collections error: %s", e)
@@ -547,49 +575,59 @@ async def featured():
         return {"gifts": []}
     if not GetResale:
         return {"gifts": [], "error": "GetResaleStarGiftsRequest missing — pip install -U telethon"}
-    try:
-        cols = (await collections()).get("collections", [])
-        by_name = {c["name"].lower(): c for c in cols}
+    # Single-flight: many splash requests collapse into ONE computation.
+    async with _featured_lock:
+        cached = cache_get("featured")
+        if cached:
+            return {"gifts": cached}
+        try:
+            cols = (await collections()).get("collections", [])
+            by_name = {c["name"].lower(): c for c in cols}
 
-        async def first_listing(gift_id):
-            res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0,
-                                                  sort_by_price=True, offset="", limit=1))
-            g = getattr(res, "gifts", []) or []
-            return serialize_unique(g[0]) if g else None
+            async def first_listing(gift_id):
+                res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0,
+                                                      sort_by_price=True, offset="", limit=1))
+                g = getattr(res, "gifts", []) or []
+                return serialize_unique(g[0]) if g else None
 
-        out = []
-        for name in FEATURED_NAMES:
-            col = by_name.get(name.lower())
-            if not col:
-                continue
-            try:
-                item = await first_listing(col["gift_id"])
-                if item:
-                    out.append(item)
-            except Exception as e:
-                log.info("featured '%s' skipped: %s", name, e)
-
-        if len(out) < 3:
-            seen = {o["name"] for o in out}
-            for col in cols:
-                if len(out) >= 3:
-                    break
-                if col["name"] in seen:
+            out = []
+            for name in FEATURED_NAMES:
+                col = by_name.get(name.lower())
+                if not col:
                     continue
                 try:
                     item = await first_listing(col["gift_id"])
                     if item:
                         out.append(item)
-                        seen.add(col["name"])
-                except Exception:
-                    continue
+                except Exception as e:
+                    log.info("featured '%s' skipped: %s", name, repr(e))
 
-        if out:
-            cache_set("featured", out, ttl=300)
-        return {"gifts": out}
-    except Exception as e:
-        log.error("featured error: %s", e)
-        return {"gifts": []}
+            # Fallback capped at a FEW tries (never iterate the whole catalog —
+            # that's what triggered the flood waits).
+            if len(out) < 3:
+                seen = {o["name"] for o in out}
+                tries = 0
+                for col in cols:
+                    if len(out) >= 3 or tries >= 5:
+                        break
+                    if col["name"] in seen:
+                        continue
+                    tries += 1
+                    try:
+                        item = await first_listing(col["gift_id"])
+                        if item:
+                            out.append(item)
+                            seen.add(col["name"])
+                    except Exception:
+                        continue
+
+            # Cache for 10 min on success; brief negative-cache on failure so a
+            # cold/flooded moment doesn't get hammered by repeated splash loads.
+            cache_set("featured", out, ttl=600 if out else 45)
+            return {"gifts": out}
+        except Exception as e:
+            log.error("featured error: %s", repr(e))
+            return {"gifts": []}
 
 
 @app.get("/api/attributes")
@@ -619,7 +657,7 @@ async def attributes(gift_id: str = Query(...)):
             elif cls == "StarGiftAttributeBackdrop":
                 backdrops.append({"name": name, "hex": color_hex(getattr(a, "center_color", None)), "rarity": rar})
         result = {"models": models, "symbols": symbols, "backdrops": backdrops}
-        cache_set(key, result, ttl=300)
+        cache_set(key, result, ttl=900)
         return result
     except Exception as e:
         log.error("attributes error: %s", e)
