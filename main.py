@@ -46,8 +46,19 @@ GETGEMS_API_KEY = os.getenv("GETGEMS_API_KEY", "")
 GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 DB_PATH = os.getenv("DB_PATH", "gifttrove.db")
-SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "30"))
+SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "100"))      # per page
+SEARCH_MAX = int(os.getenv("SEARCH_MAX", "1000"))         # hard ceiling per query
 MTPROTO_TIMEOUT = int(os.getenv("MTPROTO_TIMEOUT", "18"))   # seconds per call
+
+# ─── Access gate ──────────────────────────────────────────────────────────────
+# Admins bypass automatically; everyone else needs the access code. BOTH live in
+# env vars so only the operator can change them (never hard-coded in the client).
+ADMIN_IDS = {s.strip() for s in os.getenv("ADMIN_IDS", "7608551523").split(",") if s.strip()}
+ACCESS_CODE = os.getenv("ACCESS_CODE", "8f70p").strip()
+
+# ─── Rate limiting (protects the backend from abuse / accidental hammering) ────
+RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))   # seconds
+RATE_MAX = int(os.getenv("RATE_MAX", "40"))         # requests per window per client
 
 _mtproto_error = ""
 FRAGMENT_CDN = "https://nft.fragment.com/gift"
@@ -84,24 +95,116 @@ def cache_set(key, val, ttl):
     _cache[key] = (time.time() + ttl, val)
 
 
-# ─── SQLite referrals ─────────────────────────────────────────────────────────
+# ─── SQLite: referrals + privacy-safe analytics ──────────────────────────────
+# NOTE: Render's free filesystem is EPHEMERAL — this DB resets on every deploy/
+# restart. For durable analytics use a persistent disk or (better) Postgres.
+# See the scaling notes at the bottom of this file.
+import hashlib
+
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def _uid_hash(uid):
+    """Store a salted hash, never the raw Telegram id (privacy by design)."""
+    if not uid:
+        return "anon"
+    return hashlib.sha256(f"gt::{uid}".encode()).hexdigest()[:24]
+
+
 def init_db():
     with db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS referrals (
-                   uid TEXT NOT NULL,
-                   referred_by TEXT NOT NULL,
-                   ts INTEGER NOT NULL,
-                   PRIMARY KEY (uid, referred_by)
-               )"""
+                   uid TEXT NOT NULL, referred_by TEXT NOT NULL, ts INTEGER NOT NULL,
+                   PRIMARY KEY (uid, referred_by))"""
+        )
+        # One row per visitor (hashed). No names, no usernames, no PII.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS members (
+                   uid_hash TEXT PRIMARY KEY,
+                   first_seen INTEGER NOT NULL,
+                   last_seen INTEGER NOT NULL,
+                   visits INTEGER NOT NULL DEFAULT 1)"""
+        )
+        # Aggregated search counts per gift name (no user linkage).
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS gift_searches (
+                   gift TEXT PRIMARY KEY,
+                   count INTEGER NOT NULL DEFAULT 0,
+                   last_ts INTEGER NOT NULL)"""
+        )
+        # Lightweight event log (daily rollups are derived from this).
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS events (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   kind TEXT NOT NULL, ts INTEGER NOT NULL)"""
         )
         conn.commit()
+
+
+def track_visit(uid):
+    """Upsert a visitor; returns True if this is a brand-new member."""
+    h = _uid_hash(uid)
+    now = int(time.time())
+    try:
+        with db() as conn:
+            cur = conn.execute("SELECT visits FROM members WHERE uid_hash=?", (h,))
+            row = cur.fetchone()
+            if row:
+                conn.execute("UPDATE members SET last_seen=?, visits=visits+1 WHERE uid_hash=?", (now, h))
+                conn.execute("INSERT INTO events(kind, ts) VALUES('open', ?)", (now,))
+                conn.commit()
+                return False
+            conn.execute("INSERT INTO members(uid_hash, first_seen, last_seen, visits) VALUES(?,?,?,1)", (h, now, now))
+            conn.execute("INSERT INTO events(kind, ts) VALUES('new_member', ?)", (now,))
+            conn.commit()
+            return True
+    except Exception as e:
+        log.info("track_visit skipped: %s", e)
+        return False
+
+
+def track_search(gift):
+    if not gift:
+        return
+    now = int(time.time())
+    try:
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO gift_searches(gift, count, last_ts) VALUES(?,1,?)
+                   ON CONFLICT(gift) DO UPDATE SET count=count+1, last_ts=excluded.last_ts""",
+                (gift.strip()[:64], now),
+            )
+            conn.execute("INSERT INTO events(kind, ts) VALUES('search', ?)", (now,))
+            conn.commit()
+    except Exception as e:
+        log.info("track_search skipped: %s", e)
+
+
+# ─── In-memory rate limiter (per hashed client, sliding window) ───────────────
+_rate = {}
+
+
+def rate_ok(uid):
+    h = _uid_hash(uid)
+    now = time.time()
+    bucket = [t for t in _rate.get(h, []) if t > now - RATE_WINDOW]
+    if len(bucket) >= RATE_MAX:
+        _rate[h] = bucket
+        return False
+    bucket.append(now)
+    _rate[h] = bucket
+    # opportunistic cleanup so the dict can't grow unbounded
+    if len(_rate) > 20000:
+        for k in list(_rate.keys())[:5000]:
+            if not _rate[k] or _rate[k][-1] < now - RATE_WINDOW:
+                _rate.pop(k, None)
+    return True
 
 
 # ─── Telethon client lifecycle ────────────────────────────────────────────────
@@ -118,8 +221,8 @@ async def _register_bot_handlers():
     async def _start(event):
         try:
             buttons = [
-                [Button.url("🎁 Open GiftTrove", MINIAPP_URL)],
-                [Button.url("💬 Join Community", COMMUNITY_URL)],
+                [Button.url(" Open GiftTrove", MINIAPP_URL)],
+                [Button.url(" Join Community", COMMUNITY_URL)],
             ]
             await event.respond(WELCOME_TEXT, file=WELCOME_IMAGE, buttons=buttons)
         except Exception as e:
@@ -193,7 +296,16 @@ async def background_telethon_initializer():
     else:
         log.warning("BOT_TOKEN not provided — /start handler skipped.")
 
-    # 3) Keepalive: ping Telegram every 2 min so the socket never goes stale.
+    # 2b) Pre-warm the gift cache so the very first visitor sees gifts instantly.
+    if client is not None:
+        try:
+            await featured()
+            log.info("Featured gifts pre-warmed.")
+        except Exception as e:
+            log.info("featured pre-warm skipped: %s", e)
+
+    # 3) Keepalive: ping Telegram every 2 min so the socket never goes stale,
+    #    and refresh the featured cache so it's always warm.
     while True:
         await asyncio.sleep(120)
         try:
@@ -214,6 +326,12 @@ async def background_telethon_initializer():
                 await _connect_user_session()
             except Exception as e2:
                 log.error("keepalive reconnect failed: %s", e2)
+        # keep featured fresh (cache TTL is 600s; refresh a bit before it lapses)
+        try:
+            if client is not None and not cache_get("featured"):
+                await featured()
+        except Exception:
+            pass
 
 
 @asynccontextmanager
@@ -674,30 +792,87 @@ async def search(
     symbol: str = Query(""),
     backdrop: str = Query(""),
     markets: str = Query(""),
+    uid: str = Query(""),
+    sort: str = Query("price_asc"),   # price_asc | price_desc
+    offset: str = Query(""),          # resale page cursor for "load more"
+    limit: int = Query(SEARCH_LIMIT),
+    min_price: float = Query(0),
+    max_price: float = Query(0),
 ):
+    if not rate_ok(uid):
+        return {"results": [], "rate_limited": True}
+    if gift:
+        track_search(gift)
+
     want = set([m.strip() for m in markets.split(",") if m.strip()]) if markets else set()
     results = []
+    next_offset = ""
+    limit = max(1, min(int(limit or SEARCH_LIMIT), SEARCH_MAX))
     GetResale = _payments("GetResaleStarGiftsRequest")
+
     if client is not None and GetResale and gift_id and (not want or "Telegram" in want):
         try:
-            res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0,
-                                                  sort_by_price=True, offset="", limit=SEARCH_LIMIT))
-            for g in getattr(res, "gifts", []) or []:
-                item = serialize_unique(g)
-                if num and str(item.get("num")) != str(num):
-                    continue
-                if model and (item.get("model") or "").lower() != model.lower():
-                    continue
-                if symbol and (item.get("symbol") or "").lower() != symbol.lower():
-                    continue
-                if backdrop and (item.get("backdrop") or "").lower() != backdrop.lower():
-                    continue
-                results.append(item)
+            cur = offset or ""
+            fetched = 0
+            # Page through Telegram's resale listings until we hit `limit`
+            # (the API returns a chunk + next_offset; we follow the cursor).
+            for _ in range(20):  # safety cap on pages
+                page = min(50, limit - fetched)
+                if page <= 0:
+                    break
+                res = await _invoke(lambda c=cur, p=page: GetResale(
+                    gift_id=int(gift_id), attributes_hash=0,
+                    sort_by_price=(sort != "price_desc"),
+                    offset=c, limit=p,
+                ))
+                chunk = getattr(res, "gifts", []) or []
+                for g in chunk:
+                    item = serialize_unique(g)
+                    if num and str(item.get("num")) != str(num):
+                        continue
+                    if model and (item.get("model") or "").lower() != model.lower():
+                        continue
+                    if symbol and (item.get("symbol") or "").lower() != symbol.lower():
+                        continue
+                    if backdrop and (item.get("backdrop") or "").lower() != backdrop.lower():
+                        continue
+                    results.append(item)
+                fetched += len(chunk)
+                cur = getattr(res, "next_offset", "") or ""
+                next_offset = cur
+                if not cur or len(chunk) == 0:
+                    next_offset = ""
+                    break
+        except FloodWaitError:
+            return {"results": results, "next_offset": next_offset, "flood": True}
         except Exception as e:
-            log.error("native search error: %s", e)
+            log.error("native search error: %s", repr(e))
+
     if gift and (not want or "GetGems" in want):
         results.extend(await getgems_search(gift, limit=12))
-    return {"results": results}
+
+    # Optional price-range filter (applies to numeric prices in the page).
+    if min_price or max_price:
+        lo = float(min_price or 0)
+        hi = float(max_price or 0)
+        def _in(p):
+            if p is None:
+                return False
+            if lo and p < lo:
+                return False
+            if hi and p > hi:
+                return False
+            return True
+        results = [r for r in results if _in(r.get("price"))]
+
+    # Sort by price (None last). Telegram already sorts, but GetGems + filters
+    # can interleave, so we enforce it for a consistent UI.
+    rev = (sort == "price_desc")
+    results.sort(key=lambda r: (r.get("price") is None, r.get("price") or 0), reverse=rev)
+    if rev:
+        results.sort(key=lambda r: r.get("price") is None)  # keep None last
+
+    return {"results": results, "next_offset": next_offset, "count": len(results)}
 
 
 @app.get("/api/gift")
@@ -729,8 +904,51 @@ async def gift(slug: str = Query(...)):
         return {"error": str(e)}
 
 
+@app.get("/api/access")
+async def access(uid: str = Query(""), code: str = Query("")):
+    """
+    Gate the app. Admins are allowed automatically; everyone else must supply
+    the access code. The code + admin list live in env vars on the server, so
+    they CANNOT be changed from the client — only the operator can rotate them.
+    Also records the (anonymous) visit for analytics on success.
+    """
+    is_admin = str(uid).strip() in ADMIN_IDS
+    ok = is_admin or (code.strip() == ACCESS_CODE and ACCESS_CODE != "")
+    if ok:
+        new_member = track_visit(uid)
+        return {"ok": True, "admin": is_admin, "new_member": new_member}
+    return {"ok": False, "admin": False}
+
+
+@app.get("/api/analytics")
+async def analytics(uid: str = Query(""), code: str = Query("")):
+    """Admin-only product analytics. No personal data is stored or returned."""
+    if str(uid).strip() not in ADMIN_IDS and code.strip() != ACCESS_CODE:
+        return {"error": "forbidden"}
+    now = int(time.time())
+    day = now - 86400
+    week = now - 7 * 86400
+    out = {}
+    try:
+        with db() as conn:
+            out["members_total"] = conn.execute("SELECT COUNT(*) c FROM members").fetchone()["c"]
+            out["returning_members"] = conn.execute("SELECT COUNT(*) c FROM members WHERE visits>1").fetchone()["c"]
+            out["active_24h"] = conn.execute("SELECT COUNT(*) c FROM members WHERE last_seen>?", (day,)).fetchone()["c"]
+            out["active_7d"] = conn.execute("SELECT COUNT(*) c FROM members WHERE last_seen>?", (week,)).fetchone()["c"]
+            out["new_members_24h"] = conn.execute("SELECT COUNT(*) c FROM events WHERE kind='new_member' AND ts>?", (day,)).fetchone()["c"]
+            out["searches_total"] = conn.execute("SELECT COALESCE(SUM(count),0) c FROM gift_searches").fetchone()["c"]
+            out["searches_24h"] = conn.execute("SELECT COUNT(*) c FROM events WHERE kind='search' AND ts>?", (day,)).fetchone()["c"]
+            out["opens_24h"] = conn.execute("SELECT COUNT(*) c FROM events WHERE kind IN ('open','new_member') AND ts>?", (day,)).fetchone()["c"]
+            top = conn.execute("SELECT gift, count FROM gift_searches ORDER BY count DESC LIMIT 15").fetchall()
+            out["top_searches"] = [{"gift": r["gift"], "count": r["count"]} for r in top]
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
 @app.get("/api/referrals")
 async def referrals(uid: str = Query(...)):
+    track_visit(uid)   # opening the profile counts as a visit
     with db() as conn:
         row = conn.execute(
             "SELECT COUNT(DISTINCT referred_by) AS n FROM referrals WHERE uid = ?", (str(uid),)
@@ -755,6 +973,27 @@ async def add_referral(payload: dict = Body(...)):
     except Exception as e:
         log.error("referral insert error: %s", e)
         return {"ok": False}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SCALING NOTES — read before chasing big user numbers
+# ═════════════════════════════════════════════════════════════════════════════
+#  This single free instance + SQLite + ONE Telegram user-session is great for
+#  launch, but it will NOT serve millions of concurrent users. The honest path:
+#
+#   1. Database: move from SQLite (ephemeral on Render free) to managed Postgres.
+#      Analytics writes above are written to be trivially portable.
+#   2. App tier: run several stateless web instances behind Render's load
+#      balancer; keep the cache in Redis (shared) instead of in-process dicts.
+#   3. THE REAL BOTTLENECK is Telegram itself: one user-session is rate-limited
+#      (you saw the flood waits). Serving millions of live queries needs either
+#      a pool of many sessions or an official data arrangement — caching (as we
+#      do) absorbs most of it, since most users view the same popular gifts.
+#   4. Rate limiting (above) protects you today; tune RATE_MAX / RATE_WINDOW.
+#
+#  In short: the architecture is ready to grow, but "5M active" is a Postgres +
+#  Redis + multi-instance + Telegram-throughput project, not a config flag.
+# ═════════════════════════════════════════════════════════════════════════════
 
 
 if __name__ == "__main__":
