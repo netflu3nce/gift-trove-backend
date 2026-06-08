@@ -40,6 +40,7 @@ GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 DB_PATH = os.getenv("DB_PATH", "gifttrove.db")
 SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "30"))
+MTPROTO_TIMEOUT = int(os.getenv("MTPROTO_TIMEOUT", "18"))   # seconds per call
 
 _mtproto_error = ""
 FRAGMENT_CDN = "https://nft.fragment.com/gift"
@@ -121,42 +122,56 @@ async def _register_bot_handlers():
                 pass
 
 
-async def background_telethon_initializer():
-    """Connect Telethon in the background so Uvicorn binds the port instantly."""
-    global client, bot, _mtproto_error
-
+async def _connect_user_session():
+    """(Re)connect the user session. Returns True on success."""
+    global client, _mtproto_error
     if not (TELETHON_OK and API_ID and API_HASH and STRING_SESSION):
         _mtproto_error = (
             "STRING_SESSION env var not set" if not STRING_SESSION else
             "API_ID / API_HASH env vars not set" if not (API_ID and API_HASH) else
             "Telethon package unavailable"
         )
-        log.warning("MTProto background initialization bypassed: %s", _mtproto_error)
-        return
-
-    for attempt in (1, 2):
-        try:
-            log.info("MTProto: Connecting user session (Attempt %d)...", attempt)
+        return False
+    try:
+        if client is None:
             client = TelegramClient(StringSession(STRING_SESSION), int(API_ID), API_HASH)
-            await client.connect()
-            if not await client.is_user_authorized():
-                _mtproto_error = "Session not authorised — regenerate STRING_SESSION via gen_session.py"
-                log.error("MTProto: %s", _mtproto_error)
-            else:
-                me = await client.get_me()
-                _mtproto_error = ""
-                log.info("MTProto session live as @%s", getattr(me, "username", me.id))
-            break
-        except Exception as e:
-            _mtproto_error = str(e)
-            log.error("MTProto connection attempt %d failed: %s", attempt, e)
-            client = None
-            if attempt == 1:
-                await asyncio.sleep(5)
+        if not client.is_connected():
+            await asyncio.wait_for(client.connect(), timeout=20)
+        if not await client.is_user_authorized():
+            _mtproto_error = "Session not authorised — regenerate STRING_SESSION via gen_session.py"
+            log.error("MTProto: %s", _mtproto_error)
+            return False
+        _mtproto_error = ""
+        return True
+    except Exception as e:
+        _mtproto_error = str(e)
+        log.error("MTProto connect failed: %s", e)
+        return False
 
+
+async def background_telethon_initializer():
+    """Connect Telethon in the background (so Uvicorn binds the port instantly),
+    then keep the connection warm with a keepalive loop."""
+    global bot
+
+    # 1) User session (with one retry)
+    for attempt in (1, 2):
+        log.info("MTProto: connecting user session (attempt %d)...", attempt)
+        ok = await _connect_user_session()
+        if ok:
+            try:
+                me = await asyncio.wait_for(client.get_me(), timeout=20)
+                log.info("MTProto session live as @%s", getattr(me, "username", me.id))
+            except Exception as e:
+                log.warning("get_me after connect failed: %s", e)
+            break
+        if attempt == 1:
+            await asyncio.sleep(5)
+
+    # 2) Bot (/start)
     if TELETHON_OK and API_ID and API_HASH and BOT_TOKEN:
         try:
-            log.info("MTProto: Initializing Bot instance...")
+            log.info("MTProto: initializing bot...")
             bot = TelegramClient(StringSession(), int(API_ID), API_HASH)
             await bot.start(bot_token=BOT_TOKEN)
             await _register_bot_handlers()
@@ -167,6 +182,28 @@ async def background_telethon_initializer():
             bot = None
     else:
         log.warning("BOT_TOKEN not provided — /start handler skipped.")
+
+    # 3) Keepalive: ping Telegram every 2 min so the socket never goes stale.
+    while True:
+        await asyncio.sleep(120)
+        try:
+            async with _mtproto_lock:
+                if client is not None and not client.is_connected():
+                    await asyncio.wait_for(client.connect(), timeout=20)
+                if client is not None:
+                    await asyncio.wait_for(client.get_me(), timeout=20)
+            _mtproto_error = "" if client and client.is_connected() else _mtproto_error
+        except Exception as e:
+            log.warning("keepalive: connection looked dead (%s) — reconnecting", e)
+            try:
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                await _connect_user_session()
+            except Exception as e2:
+                log.error("keepalive reconnect failed: %s", e2)
 
 
 @asynccontextmanager
@@ -198,6 +235,37 @@ def _payments(name):
     if not TELETHON_OK:
         return None
     return getattr(functions.payments, name, None)
+
+
+async def _invoke(build, timeout=None):
+    """
+    Run an MTProto request with a HARD timeout + one reconnect-and-retry.
+    `build` is a zero-arg callable returning a FRESH request object (so we can
+    safely re-send it after a reconnect). Never hangs the worker.
+    """
+    if client is None:
+        raise RuntimeError("MTProto client not initialised yet")
+    timeout = timeout or MTPROTO_TIMEOUT
+    last = None
+    async with _mtproto_lock:
+        for attempt in (1, 2):
+            try:
+                if not client.is_connected():
+                    await asyncio.wait_for(client.connect(), timeout=15)
+                return await asyncio.wait_for(client(build()), timeout=timeout)
+            except Exception as e:
+                last = e
+                log.error("MTProto invoke attempt %d failed: %s", attempt, e)
+                if attempt == 1:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(client.connect(), timeout=15)
+                    except Exception as e2:
+                        log.error("reconnect failed: %s", e2)
+    raise last if last else RuntimeError("MTProto invoke failed")
 
 
 def color_hex(c):
@@ -364,9 +432,26 @@ async def health():
     return resp
 
 
+@app.get("/api/ping")
+async def ping():
+    """Minimal authenticated round-trip test (timeout-protected)."""
+    if client is None:
+        return {"ok": False, "reason": "client not initialised", "mtproto_error": _mtproto_error or None}
+    t0 = time.time()
+    try:
+        async with _mtproto_lock:
+            if not client.is_connected():
+                await asyncio.wait_for(client.connect(), timeout=15)
+            me = await asyncio.wait_for(client.get_me(), timeout=MTPROTO_TIMEOUT)
+        return {"ok": True, "me": getattr(me, "username", None) or getattr(me, "id", None),
+                "ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "ms": int((time.time() - t0) * 1000)}
+
+
 @app.get("/api/debug")
 async def debug():
-    """Read-only diagnostics. Open in a browser to see why gifts aren't loading."""
+    """Hang-proof diagnostics. Open in a browser to see exactly what's happening."""
     info = {
         "mtproto_connected": bool(client and client.is_connected()),
         "mtproto_error": _mtproto_error or None,
@@ -375,13 +460,14 @@ async def debug():
         "featured_names": FEATURED_NAMES,
     }
     GetStarGifts = _payments("GetStarGiftsRequest")
-    if not (client and client.is_connected() and GetStarGifts):
+    if not (client is not None and GetStarGifts):
         info["catalog_call"] = "skipped — no client/function"
         return info
+    t0 = time.time()
     try:
-        async with _mtproto_lock:
-            res = await client(GetStarGifts(hash=0))
+        res = await _invoke(lambda: GetStarGifts(hash=0))
         gifts = getattr(res, "gifts", []) or []
+        info["catalog_ms"] = int((time.time() - t0) * 1000)
         info["response_type"] = type(res).__name__
         info["gift_count"] = len(gifts)
         info["sample"] = [
@@ -395,6 +481,7 @@ async def debug():
         lc = [t.lower() for t in titles]
         info["featured_matches"] = [n for n in FEATURED_NAMES if n.lower() in lc]
     except Exception as e:
+        info["catalog_ms"] = int((time.time() - t0) * 1000)
         info["catalog_error"] = str(e)
         info["catalog_traceback"] = traceback.format_exc()[-1800:]
 
@@ -406,9 +493,8 @@ async def debug():
                 first_id = s["id"]
                 break
         if GetResale and first_id:
-            async with _mtproto_lock:
-                rr = await client(GetResale(gift_id=int(first_id), attributes_hash=0,
-                                            sort_by_price=True, offset="", limit=2))
+            rr = await _invoke(lambda: GetResale(gift_id=int(first_id), attributes_hash=0,
+                                                 sort_by_price=True, offset="", limit=2))
             rg = getattr(rr, "gifts", []) or []
             info["resale_test_gift_id"] = first_id
             info["resale_test_count"] = len(rg)
@@ -425,14 +511,13 @@ async def collections():
     cached = cache_get("collections")
     if cached:
         return {"collections": cached}
-    if not client or not client.is_connected():
-        return {"collections": [], "error": "MTProto background sync still initialising."}
     GetStarGifts = _payments("GetStarGiftsRequest")
+    if client is None:
+        return {"collections": [], "error": "MTProto background sync still initialising."}
     if not GetStarGifts:
         return {"collections": [], "error": "GetStarGiftsRequest missing — pip install -U telethon"}
     try:
-        async with _mtproto_lock:
-            res = await client(GetStarGifts(hash=0))
+        res = await _invoke(lambda: GetStarGifts(hash=0))
         raw = getattr(res, "gifts", []) or []
         out = []
         for g in raw:
@@ -457,9 +542,9 @@ async def featured():
     cached = cache_get("featured")
     if cached:
         return {"gifts": cached}
-    if not client or not client.is_connected():
-        return {"gifts": []}
     GetResale = _payments("GetResaleStarGiftsRequest")
+    if client is None:
+        return {"gifts": []}
     if not GetResale:
         return {"gifts": [], "error": "GetResaleStarGiftsRequest missing — pip install -U telethon"}
     try:
@@ -467,9 +552,8 @@ async def featured():
         by_name = {c["name"].lower(): c for c in cols}
 
         async def first_listing(gift_id):
-            async with _mtproto_lock:
-                res = await client(GetResale(gift_id=int(gift_id), attributes_hash=0,
-                                             sort_by_price=True, offset="", limit=1))
+            res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0,
+                                                  sort_by_price=True, offset="", limit=1))
             g = getattr(res, "gifts", []) or []
             return serialize_unique(g[0]) if g else None
 
@@ -515,14 +599,13 @@ async def attributes(gift_id: str = Query(...)):
     if cached:
         return cached
     empty = {"models": [], "symbols": [], "backdrops": []}
-    if not client or not client.is_connected():
-        return empty
     GetResale = _payments("GetResaleStarGiftsRequest")
+    if client is None:
+        return empty
     if not GetResale:
         return {**empty, "error": "GetResaleStarGiftsRequest missing — pip install -U telethon"}
     try:
-        async with _mtproto_lock:
-            res = await client(GetResale(gift_id=int(gift_id), attributes_hash=0, offset="", limit=1))
+        res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0, offset="", limit=1))
         models, symbols, backdrops = [], [], []
         for a in getattr(res, "attributes", []) or []:
             cls = type(a).__name__
@@ -556,26 +639,24 @@ async def search(
 ):
     want = set([m.strip() for m in markets.split(",") if m.strip()]) if markets else set()
     results = []
-    if client and client.is_connected() and gift_id and (not want or "Telegram" in want):
-        GetResale = _payments("GetResaleStarGiftsRequest")
-        if GetResale:
-            try:
-                async with _mtproto_lock:
-                    res = await client(GetResale(gift_id=int(gift_id), attributes_hash=0,
-                                                 sort_by_price=True, offset="", limit=SEARCH_LIMIT))
-                for g in getattr(res, "gifts", []) or []:
-                    item = serialize_unique(g)
-                    if num and str(item.get("num")) != str(num):
-                        continue
-                    if model and (item.get("model") or "").lower() != model.lower():
-                        continue
-                    if symbol and (item.get("symbol") or "").lower() != symbol.lower():
-                        continue
-                    if backdrop and (item.get("backdrop") or "").lower() != backdrop.lower():
-                        continue
-                    results.append(item)
-            except Exception as e:
-                log.error("native search error: %s", e)
+    GetResale = _payments("GetResaleStarGiftsRequest")
+    if client is not None and GetResale and gift_id and (not want or "Telegram" in want):
+        try:
+            res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0,
+                                                  sort_by_price=True, offset="", limit=SEARCH_LIMIT))
+            for g in getattr(res, "gifts", []) or []:
+                item = serialize_unique(g)
+                if num and str(item.get("num")) != str(num):
+                    continue
+                if model and (item.get("model") or "").lower() != model.lower():
+                    continue
+                if symbol and (item.get("symbol") or "").lower() != symbol.lower():
+                    continue
+                if backdrop and (item.get("backdrop") or "").lower() != backdrop.lower():
+                    continue
+                results.append(item)
+        except Exception as e:
+            log.error("native search error: %s", e)
     if gift and (not want or "GetGems" in want):
         results.extend(await getgems_search(gift, limit=12))
     return {"results": results}
@@ -583,21 +664,19 @@ async def search(
 
 @app.get("/api/gift")
 async def gift(slug: str = Query(...)):
-    if not client or not client.is_connected():
-        return {"error": "mtproto-offline"}
     GetUnique = _payments("GetUniqueStarGiftRequest")
+    if client is None:
+        return {"error": "mtproto-offline"}
     if not GetUnique:
         return {"error": "GetUniqueStarGiftRequest missing — pip install -U telethon"}
     try:
-        async with _mtproto_lock:
-            res = await client(GetUnique(slug=slug))
+        res = await _invoke(lambda: GetUnique(slug=slug))
         g = getattr(res, "gift", res)
         data = serialize_unique(g)
         GetValue = _payments("GetUniqueStarGiftValueInfoRequest")
         if GetValue:
             try:
-                async with _mtproto_lock:
-                    v = await client(GetValue(slug=slug))
+                v = await _invoke(lambda: GetValue(slug=slug))
                 fp = getattr(v, "floor_price", None)
                 if fp is not None:
                     fa = getattr(fp, "amount", None)
