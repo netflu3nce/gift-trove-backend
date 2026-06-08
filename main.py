@@ -56,12 +56,17 @@ except Exception:
 # ─── Config ───────────────────────────────────────────────────────────────────
 API_ID = os.getenv("API_ID", "")
 API_HASH = os.getenv("API_HASH", "")
-STRING_SESSION = os.getenv("STRING_SESSION", "")
+# .strip() is critical — Render's paste UI often adds a trailing newline,
+# which makes the string truthy but breaks the session decode.
+STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 GETGEMS_API_KEY = os.getenv("GETGEMS_API_KEY", "")
 GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 DB_PATH = os.getenv("DB_PATH", "gifttrove.db")
 SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "30"))
+
+# Captured at startup so the health endpoint can explain why mtproto is down.
+_mtproto_error: str = ""
 
 FRAGMENT_CDN = "https://nft.fragment.com/gift"
 
@@ -72,8 +77,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WELCOME_IMAGE = os.getenv("WELCOME_IMAGE", "https://i.ibb.co/5Xmf7H6b/Inria-Serif-1.png")
 WELCOME_TEXT = os.getenv(
     "WELCOME_TEXT",
-    "Welcome to GiftTrove! Scout unique Telegram gifts from different "
-    "marketplaces all at a go.\n\nGiftTrove",
+    "**Welcome to GiftTrove! Scout unique Telegram gifts from different "
+    "marketplaces all at a go.**\n\n**GiftTrove**",
 )
 MINIAPP_URL = os.getenv("MINIAPP_URL", "https://t.me/gifttrovebot/app")
 COMMUNITY_URL = os.getenv("COMMUNITY_URL", "https://t.me/gifttrove")
@@ -148,24 +153,39 @@ async def _register_bot_handlers():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, bot
+    global client, bot, _mtproto_error
     init_db()
-    if TELETHON_OK and API_ID and API_HASH and STRING_SESSION:
-        try:
-            client = TelegramClient(StringSession(STRING_SESSION), int(API_ID), API_HASH)
-            await client.connect()
-            if not await client.is_user_authorized():
-                log.error("MTProto session is not authorised — regenerate STRING_SESSION (see gen_session.py).")
-            else:
-                me = await client.get_me()
-                log.info("MTProto session live as @%s", getattr(me, "username", me.id))
-        except Exception as e:
-            log.error("Failed to start Telethon client: %s", e)
-            client = None
-    else:
-        log.warning("MTProto not configured (need API_ID, API_HASH, STRING_SESSION). Live data disabled.")
 
-    # Start the /start bot (optional — only if BOT_TOKEN is set)
+    if not (TELETHON_OK and API_ID and API_HASH and STRING_SESSION):
+        _mtproto_error = (
+            "STRING_SESSION env var not set"
+            if not STRING_SESSION else
+            "API_ID / API_HASH env vars not set"
+            if not (API_ID and API_HASH) else
+            "Telethon package unavailable"
+        )
+        log.warning("MTProto disabled: %s", _mtproto_error)
+    else:
+        for attempt in (1, 2):
+            try:
+                client = TelegramClient(StringSession(STRING_SESSION), int(API_ID), API_HASH)
+                await client.connect()
+                if not await client.is_user_authorized():
+                    _mtproto_error = "Session not authorised — regenerate STRING_SESSION via gen_session.py"
+                    log.error("MTProto: %s", _mtproto_error)
+                    # Keep client set; it may still work for some calls.
+                else:
+                    me = await client.get_me()
+                    log.info("MTProto session live as @%s", getattr(me, "username", me.id))
+                break
+            except Exception as e:
+                _mtproto_error = str(e)
+                log.error("MTProto connect attempt %d failed: %s", attempt, e)
+                client = None
+                if attempt == 1:
+                    await asyncio.sleep(6)   # wait before retry
+
+    # Start the /start bot (separate from the user session — only if BOT_TOKEN set)
     if TELETHON_OK and API_ID and API_HASH and BOT_TOKEN:
         try:
             bot = TelegramClient(StringSession(), int(API_ID), API_HASH)
@@ -310,63 +330,119 @@ def serialize_unique(g):
 
 
 # ─── GetGems (OPTIONAL secondary source) ──────────────────────────────────────
-async def getgems_search(gift_name, limit=12):
+async def getgems_search(gift_name, limit=12, collection_address=None):
     """
-    Optional GetGems GraphQL listings. The exact query/fields depend on your
-    key's schema — confirm them in GetGems' API explorer and adjust below.  # VERIFY
-    Fails soft (returns []) so it never breaks /api/search.
+    Query GetGems GraphQL for listed items.
+    Uses the collection address (from the Telegram collections list) to find
+    items on sale sorted by price. Falls back to name-search if no address given.
+    Fails soft — returns [] on any error so it never blocks /api/search.
     """
     if not (GETGEMS_API_KEY and HTTPX_OK and gift_name):
         return []
-    # Placeholder query — REPLACE field names with those exposed to your key.
-    query = """
-    query Search($q: String!, $first: Int!) {
-      nftSearch(query: $q, first: $first) {
-        edges { node { name address content { ... on NftContentImage { image { sized(width:200,height:200) } } }
-                        sale { ... on NftSaleFixPrice { fullPrice } } } }
-      }
-    }"""
+
+    headers = {"Authorization": f"Bearer {GETGEMS_API_KEY}", "Content-Type": "application/json"}
+
+    # ── Strategy 1: collection items by TON address (most reliable) ────────────
+    if collection_address:
+        query = """
+        query CollectionItems($addr: String!, $first: Int!, $cursor: String) {
+          nftCollectionItems(
+            collectionAddress: $addr
+            first: $first
+            after: $cursor
+            filter: { saleState: onSale }
+            sort: PRICE_LOW_TO_HIGH
+          ) {
+            cursor
+            items {
+              name
+              address
+              sale {
+                ... on NftSaleFixPrice { fullPrice }
+              }
+              previews { url resolution }
+            }
+          }
+        }"""
+        variables = {"addr": collection_address, "first": limit}
+        op = "nftCollectionItems"
+    else:
+        # ── Strategy 2: text search (broader but less precise) ─────────────────
+        query = """
+        query Search($q: String!, $first: Int!) {
+          nftSearch(text: $q, first: $first, filter: { saleState: onSale }) {
+            items {
+              name
+              address
+              sale {
+                ... on NftSaleFixPrice { fullPrice }
+              }
+              previews { url resolution }
+            }
+          }
+        }"""
+        variables = {"q": gift_name, "first": limit}
+        op = "nftSearch"
+
     try:
         async with httpx.AsyncClient(timeout=12) as h:
             r = await h.post(
                 GETGEMS_GRAPHQL,
-                json={"query": query, "variables": {"q": gift_name, "first": limit}},
-                headers={"Authorization": f"Bearer {GETGEMS_API_KEY}"},
+                json={"query": query, "variables": variables},
+                headers=headers,
             )
-            data = r.json()
-        out = []
-        edges = (((data or {}).get("data") or {}).get("nftSearch") or {}).get("edges") or []
-        for e in edges:
-            n = e.get("node") or {}
-            price_nano = (((n.get("sale") or {}).get("fullPrice")))
-            price = round(int(price_nano) / 1e9, 4) if price_nano else None
-            img = ((((n.get("content") or {}).get("image") or {}).get("sized")))
-            out.append({
-                "id": n.get("address"),
-                "slug": None, "num": None,
-                "name": n.get("name") or gift_name,
-                "model": None, "modelRarity": None, "symbol": None,
-                "backdrop": None, "backdropHex": None,
-                "price": price, "currency": "TON",
-                "market": "GetGems",
-                "url": f"https://getgems.io/nft/{n.get('address')}" if n.get("address") else None,
-                "image": img, "animation": None,
-            })
-        return out
+        data = r.json()
     except Exception as e:
-        log.info("GetGems search skipped: %s", e)
+        log.info("GetGems request failed: %s", e)
         return []
+
+    errors = data.get("errors")
+    if errors:
+        log.info("GetGems %s errors: %s", op, errors)
+        return []
+
+    gql_data = (data.get("data") or {})
+    root = gql_data.get(op) or {}
+    items = root.get("items") or []
+
+    out = []
+    for n in items:
+        price_nano = ((n.get("sale") or {}).get("fullPrice"))
+        price = round(int(price_nano) / 1e9, 4) if price_nano else None
+        # pick the largest preview image available
+        previews = sorted(n.get("previews") or [], key=lambda p: p.get("resolution") or 0)
+        img = previews[-1].get("url") if previews else None
+        addr = n.get("address")
+        out.append({
+            "id": addr,
+            "slug": None, "num": None,
+            "name": n.get("name") or gift_name,
+            "model": None, "modelRarity": None, "symbol": None,
+            "backdrop": None, "backdropHex": None,
+            "price": price, "currency": "TON",
+            "market": "GetGems",
+            "url": f"https://getgems.io/nft/{addr}" if addr else None,
+            "image": img, "animation": None,
+        })
+    return out
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {
+    star_gifts_ok = _payments("GetStarGiftsRequest") is not None
+    resale_ok = _payments("GetResaleStarGiftsRequest") is not None
+    resp = {
         "ok": True,
         "mtproto": bool(client),
         "getgems": bool(GETGEMS_API_KEY),
         "cached_collections": bool(cache_get("collections")),
+        "tl_GetStarGifts": star_gifts_ok,
+        "tl_GetResaleStarGifts": resale_ok,
     }
+    if _mtproto_error:
+        resp["mtproto_error"] = _mtproto_error
+    return resp
 
 
 @app.get("/api/collections")
