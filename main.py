@@ -14,14 +14,6 @@ Endpoints (consumed verbatim by App.jsx):
     GET  /api/referrals?uid=...            -> { count }
     POST /api/referral { uid, by }         -> { ok }
     GET  /                                 -> health
-
-⚠️  IMPORTANT — these MTProto gift methods are very new. Telethon generates its
-    request classes from the TL schema, so you need a RECENT Telethon
-    (pip install -U telethon). If a request class below is missing on your
-    version, that endpoint returns {"error": "..."} instead of crashing, and the
-    log tells you to update. Field names on the returned objects are also new;
-    every parser here is defensive and the spots most likely to drift are marked
-    with  # VERIFY  so you can confirm against your installed schema.
 """
 
 import os
@@ -56,8 +48,6 @@ except Exception:
 # ─── Config ───────────────────────────────────────────────────────────────────
 API_ID = os.getenv("API_ID", "")
 API_HASH = os.getenv("API_HASH", "")
-# .strip() is critical — Render's paste UI often adds a trailing newline,
-# which makes the string truthy but breaks the session decode.
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 GETGEMS_API_KEY = os.getenv("GETGEMS_API_KEY", "")
 GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
@@ -67,12 +57,9 @@ SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "30"))
 
 # Captured at startup so the health endpoint can explain why mtproto is down.
 _mtproto_error: str = ""
-
 FRAGMENT_CDN = "https://nft.fragment.com/gift"
 
-# ─── Bot (/start handler) — separate from the user session above ──────────────
-# BOT_TOKEN comes from @BotFather. The user session (above) READS gift data;
-# this bot only replies to /start. Both run in this one process.
+# ─── Bot (/start handler) ─────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WELCOME_IMAGE = os.getenv("WELCOME_IMAGE", "https://i.ibb.co/5Xmf7H6b/Inria-Serif-1.png")
 WELCOME_TEXT = os.getenv(
@@ -83,7 +70,6 @@ WELCOME_TEXT = os.getenv(
 MINIAPP_URL = os.getenv("MINIAPP_URL", "https://t.me/gifttrovebot/app")
 COMMUNITY_URL = os.getenv("COMMUNITY_URL", "https://t.me/gifttrove")
 
-# Gifts shown on the app's launch screen (first one is the "hero"). Editable.
 FEATURED_NAMES = [n.strip() for n in os.getenv(
     "FEATURED_NAMES", "Plush Pepe,Durov's Cap,Heart Locket").split(",") if n.strip()]
 
@@ -151,56 +137,71 @@ async def _register_bot_handlers():
                 pass
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+async def background_telethon_initializer():
+    """
+    Runs asynchronous connection methods concurrently without holding up 
+    the FastAPI server instance from binding to its open render ports.
+    """
     global client, bot, _mtproto_error
-    init_db()
 
     if not (TELETHON_OK and API_ID and API_HASH and STRING_SESSION):
         _mtproto_error = (
-            "STRING_SESSION env var not set"
-            if not STRING_SESSION else
-            "API_ID / API_HASH env vars not set"
-            if not (API_ID and API_HASH) else
+            "STRING_SESSION env var not set" if not STRING_SESSION else
+            "API_ID / API_HASH env vars not set" if not (API_ID and API_HASH) else
             "Telethon package unavailable"
         )
-        log.warning("MTProto disabled: %s", _mtproto_error)
-    else:
-        for attempt in (1, 2):
-            try:
-                client = TelegramClient(StringSession(STRING_SESSION), int(API_ID), API_HASH)
-                await client.connect()
-                if not await client.is_user_authorized():
-                    _mtproto_error = "Session not authorised — regenerate STRING_SESSION via gen_session.py"
-                    log.error("MTProto: %s", _mtproto_error)
-                    # Keep client set; it may still work for some calls.
-                else:
-                    me = await client.get_me()
-                    log.info("MTProto session live as @%s", getattr(me, "username", me.id))
-                break
-            except Exception as e:
-                _mtproto_error = str(e)
-                log.error("MTProto connect attempt %d failed: %s", attempt, e)
-                client = None
-                if attempt == 1:
-                    await asyncio.sleep(6)   # wait before retry
+        log.warning("MTProto background initialization bypassed: %s", _mtproto_error)
+        return
 
-    # Start the /start bot (separate from the user session — only if BOT_TOKEN set)
+    # 1. Initialize & Connect User Session
+    for attempt in (1, 2):
+        try:
+            log.info("MTProto: Connecting user session client (Attempt %d)...", attempt)
+            client = TelegramClient(StringSession(STRING_SESSION), int(API_ID), API_HASH)
+            await client.connect()
+            if not await client.is_user_authorized():
+                _mtproto_error = "Session not authorised — regenerate STRING_SESSION via gen_session.py"
+                log.error("MTProto: %s", _mtproto_error)
+            else:
+                me = await client.get_me()
+                log.info("MTProto session live as @%s", getattr(me, "username", me.id))
+            break
+        except Exception as e:
+            _mtproto_error = str(e)
+            log.error("MTProto connection attempt %d failed: %s", attempt, e)
+            client = None
+            if attempt == 1:
+                await asyncio.sleep(5)
+
+    # 2. Initialize & Start the Interactive Bot Connection Interface
     if TELETHON_OK and API_ID and API_HASH and BOT_TOKEN:
         try:
+            log.info("MTProto: Initializing Bot instance...")
             bot = TelegramClient(StringSession(), int(API_ID), API_HASH)
             await bot.start(bot_token=BOT_TOKEN)
             await _register_bot_handlers()
             binfo = await bot.get_me()
-            log.info("Bot live as @%s — /start is active", getattr(binfo, "username", binfo.id))
+            log.info("Bot live as @%s — /start handler is fully running", getattr(binfo, "username", binfo.id))
         except Exception as e:
-            log.error("Failed to start bot: %s", e)
+            log.error("Failed to start bot background handler: %s", e)
             bot = None
     else:
-        log.warning("BOT_TOKEN not set — /start command disabled (the Mini App still works).")
+        log.warning("BOT_TOKEN not provided — Bot /start handler skipped.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Setup infrastructure instantly
+    init_db()
+
+    # Launch background network initializations asynchronously 
+    # to yield control back to Uvicorn immediately
+    init_task = asyncio.create_task(background_telethon_initializer())
 
     yield
 
+    # Clean up handlers on server instance termination
+    init_task.cancel()
     for c in (client, bot):
         if c:
             try:
@@ -221,7 +222,6 @@ app.add_middleware(
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 def _payments(name):
-    """Fetch a payments.* request class, or None if this Telethon lacks it."""
     if not TELETHON_OK:
         return None
     return getattr(functions.payments, name, None)
@@ -235,7 +235,6 @@ def color_hex(c):
 
 
 def cdn_full(slug, num):
-    """Build the lowercase 'name-num' base used by Fragment's CDN + t.me/nft."""
     base = (slug or "").strip()
     if num is not None and not base.lower().endswith(f"-{num}".lower()):
         base = f"{base}-{num}"
@@ -259,12 +258,6 @@ def _slug_from_title(title):
 
 
 def _extract_price(g):
-    """
-    Resale price extraction. The resale amount lives in a NEW field whose exact
-    name/shape can vary by schema version, so we probe a few shapes.   # VERIFY
-    Returns (price_float|None, currency_str).
-    """
-    # 1) TON-style amount objects (amount + nanos) — common in newer schema
     for attr in ("resell_amount", "resale_amount", "value_amount"):
         v = getattr(g, attr, None)
         if v is not None:
@@ -276,9 +269,7 @@ def _extract_price(g):
                 except Exception:
                     pass
             if isinstance(v, (int, float)):
-                # raw nanotons
                 return (round(float(v) / 1e9, 4), "TON")
-    # 2) Stars-priced resale
     for attr in ("resell_stars", "resale_stars"):
         v = getattr(g, attr, None)
         if isinstance(v, (int, float)) and v:
@@ -287,7 +278,6 @@ def _extract_price(g):
 
 
 def _gift_attrs(g):
-    """Pull (model, model_rarity, symbol, backdrop, backdrop_hex) off a unique gift."""
     model = model_rarity = symbol = backdrop = backdrop_hex = None
     for a in getattr(g, "attributes", []) or []:
         cls = type(a).__name__
@@ -295,7 +285,7 @@ def _gift_attrs(g):
         rar = round(rar / 10, 2) if isinstance(rar, (int, float)) else None
         if cls == "StarGiftAttributeModel":
             model, model_rarity = getattr(a, "name", None), rar
-        elif cls == "StarGiftAttributePattern":   # pattern == "symbol" in the UI
+        elif cls == "StarGiftAttributePattern":
             symbol = getattr(a, "name", None)
         elif cls == "StarGiftAttributeBackdrop":
             backdrop = getattr(a, "name", None)
@@ -312,7 +302,7 @@ def serialize_unique(g):
     price, currency = _extract_price(g)
     return {
         "id": str(getattr(g, "id", base)),
-        "slug": base,                 # full 'Name-Num' (frontend lowercases for CDN)
+        "slug": base,
         "num": num,
         "name": title,
         "model": model,
@@ -331,18 +321,11 @@ def serialize_unique(g):
 
 # ─── GetGems (OPTIONAL secondary source) ──────────────────────────────────────
 async def getgems_search(gift_name, limit=12, collection_address=None):
-    """
-    Query GetGems GraphQL for listed items.
-    Uses the collection address (from the Telegram collections list) to find
-    items on sale sorted by price. Falls back to name-search if no address given.
-    Fails soft — returns [] on any error so it never blocks /api/search.
-    """
     if not (GETGEMS_API_KEY and HTTPX_OK and gift_name):
         return []
 
     headers = {"Authorization": f"Bearer {GETGEMS_API_KEY}", "Content-Type": "application/json"}
 
-    # ── Strategy 1: collection items by TON address (most reliable) ────────────
     if collection_address:
         query = """
         query CollectionItems($addr: String!, $first: Int!, $cursor: String) {
@@ -367,7 +350,6 @@ async def getgems_search(gift_name, limit=12, collection_address=None):
         variables = {"addr": collection_address, "first": limit}
         op = "nftCollectionItems"
     else:
-        # ── Strategy 2: text search (broader but less precise) ─────────────────
         query = """
         query Search($q: String!, $first: Int!) {
           nftSearch(text: $q, first: $first, filter: { saleState: onSale }) {
@@ -409,7 +391,6 @@ async def getgems_search(gift_name, limit=12, collection_address=None):
     for n in items:
         price_nano = ((n.get("sale") or {}).get("fullPrice"))
         price = round(int(price_nano) / 1e9, 4) if price_nano else None
-        # pick the largest preview image available
         previews = sorted(n.get("previews") or [], key=lambda p: p.get("resolution") or 0)
         img = previews[-1].get("url") if previews else None
         addr = n.get("address")
@@ -434,7 +415,7 @@ async def health():
     resale_ok = _payments("GetResaleStarGiftsRequest") is not None
     resp = {
         "ok": True,
-        "mtproto": bool(client),
+        "mtproto": bool(client and client.is_connected()),
         "getgems": bool(GETGEMS_API_KEY),
         "cached_collections": bool(cache_get("collections")),
         "tl_GetStarGifts": star_gifts_ok,
@@ -450,8 +431,8 @@ async def collections():
     cached = cache_get("collections")
     if cached:
         return {"collections": cached}
-    if not client:
-        return {"collections": []}  # frontend falls back to its tiny offline list
+    if not client or not client.is_connected():
+        return {"collections": [], "error": "MTProto background sync still initialising."}
     GetStarGifts = _payments("GetStarGiftsRequest")
     if not GetStarGifts:
         return {"collections": [], "error": "GetStarGiftsRequest missing — pip install -U telethon"}
@@ -466,7 +447,7 @@ async def collections():
                 "slug": getattr(g, "slug", None) or _slug_from_title(title),
                 "gift_id": str(getattr(g, "id", "")),
                 "supply": getattr(g, "availability_total", None) or getattr(g, "availability_issued", None) or 0,
-                "preview": "",  # collection-level preview omitted (needs a specific item num)
+                "preview": "",
             })
         out = [c for c in out if c["gift_id"]]
         cache_set("collections", out, ttl=600)
@@ -478,11 +459,10 @@ async def collections():
 
 @app.get("/api/featured")
 async def featured():
-    """Real animated gifts for the app's launch screen (Plush Pepe + 2 others)."""
     cached = cache_get("featured")
     if cached:
         return {"gifts": cached}
-    if not client:
+    if not client or not client.is_connected():
         return {"gifts": []}
     GetResale = _payments("GetResaleStarGiftsRequest")
     if not GetResale:
@@ -521,13 +501,12 @@ async def attributes(gift_id: str = Query(...)):
     if cached:
         return cached
     empty = {"models": [], "symbols": [], "backdrops": []}
-    if not client:
+    if not client or not client.is_connected():
         return empty
     GetResale = _payments("GetResaleStarGiftsRequest")
     if not GetResale:
         return {**empty, "error": "GetResaleStarGiftsRequest missing — pip install -U telethon"}
     try:
-        # attributes_hash=0 returns the FULL attribute list (with rarity_permille). # VERIFY arg names
         async with _mtproto_lock:
             res = await client(GetResale(gift_id=int(gift_id), attributes_hash=0, offset="", limit=1))
         models, symbols, backdrops = [], [], []
@@ -564,8 +543,7 @@ async def search(
     want = set([m.strip() for m in markets.split(",") if m.strip()]) if markets else set()
     results = []
 
-    # ── Telegram-native resale (primary) ──
-    if client and gift_id and (not want or "Telegram" in want):
+    if client and client.is_connected() and gift_id and (not want or "Telegram" in want):
         GetResale = _payments("GetResaleStarGiftsRequest")
         if GetResale:
             try:
@@ -588,7 +566,6 @@ async def search(
             except Exception as e:
                 log.error("native search error: %s", e)
 
-    # ── GetGems (optional secondary) ──
     if gift and (not want or "GetGems" in want):
         results.extend(await getgems_search(gift, limit=12))
 
@@ -597,7 +574,7 @@ async def search(
 
 @app.get("/api/gift")
 async def gift(slug: str = Query(...)):
-    if not client:
+    if not client or not client.is_connected():
         return {"error": "mtproto-offline"}
     GetUnique = _payments("GetUniqueStarGiftRequest")
     if not GetUnique:
@@ -608,7 +585,6 @@ async def gift(slug: str = Query(...)):
         g = getattr(res, "gift", res)
         data = serialize_unique(g)
 
-        # Optional richer value info (floor / avg / last sale).  # VERIFY class name
         GetValue = _payments("GetUniqueStarGiftValueInfoRequest")
         if GetValue:
             try:
