@@ -164,6 +164,16 @@ def init_db():
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                    kind TEXT NOT NULL, ts INTEGER NOT NULL)"""
         )
+        # Per-user activity so saved gifts + recent searches follow the user
+        # across devices. Keyed by the verified Telegram id; saved/searches are
+        # JSON blobs. (Referrals already sync via the referrals table.)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS user_data (
+                   uid TEXT PRIMARY KEY,
+                   saved TEXT NOT NULL DEFAULT '[]',
+                   searches TEXT NOT NULL DEFAULT '[]',
+                   updated INTEGER NOT NULL DEFAULT 0)"""
+        )
         # Indexes — keep the analytics/referral queries fast as data grows.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ref_uid ON referrals(uid);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_members_last ON members(last_seen);")
@@ -337,8 +347,34 @@ async def _register_bot_handlers():
             [Button.url("\U0001f381 Open GiftTrove", MINIAPP_URL)],
             [Button.url("\U0001f4ac Join Community", COMMUNITY_URL)],
         ]
+        # Build the message with explicit entities so the PREMIUM custom emoji
+        # render (the bot may use them because the owner has Telegram Premium).
+        from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityBold
+
+        def u16(s):
+            return len(s.encode("utf-16-le")) // 2
+
+        segs = [
+            ("emoji", "\U0001f464", EMOJI_USER),
+            ("text", " "),
+            ("bold", "Welcome to GiftTrove! Scout unique Telegram gifts from different marketplaces all at a go."),
+            ("text", "\n\n"),
+            ("bold", "GiftTrove"),
+            ("text", " "),
+            ("emoji", "\U0001f50e", EMOJI_SEARCH),
+        ]
+        text, off, ents = "", 0, []
+        for kind, *rest in segs:
+            s = rest[0]
+            ln = u16(s)
+            if kind == "emoji":
+                ents.append(MessageEntityCustomEmoji(off, ln, int(rest[1])))
+            elif kind == "bold":
+                ents.append(MessageEntityBold(off, ln))
+            text += s
+            off += ln
         try:
-            await event.respond(WELCOME_HTML, file=WELCOME_IMAGE, buttons=buttons, parse_mode="html")
+            await event.respond(text, file=WELCOME_IMAGE, buttons=buttons, formatting_entities=ents)
         except Exception as e:
             log.error("/start (custom emoji) failed: %s", e)
             try:
@@ -883,7 +919,12 @@ async def collections():
         raw = getattr(res, "gifts", []) or []
         out = []
         for g in raw:
-            title = getattr(g, "title", None) or f"Gift {getattr(g, 'id', '')}"
+            title = getattr(g, "title", None)
+            # Skip gifts with no real name — those un-named "Gift <id>" entries
+            # are non-collectible/parked star gifts and only add noise.
+            if not title or not str(title).strip():
+                continue
+            title = str(title).strip()
             out.append({
                 "name": title,
                 "slug": getattr(g, "slug", None) or _slug_from_title(title),
@@ -1097,7 +1138,8 @@ async def search(
                 chunk = getattr(res, "gifts", []) or []
                 for g in chunk:
                     item = serialize_unique(g)
-                    if num and str(item.get("num")) != str(num):
+                    # Gift number is a SUBSTRING match: "31" -> #31, #312, #5231…
+                    if num and num not in str(item.get("num", "")):
                         continue
                     # Fallback client-side filter only for attributes Telegram
                     # didn't already filter for us (e.g. id couldn't be resolved).
@@ -1273,6 +1315,138 @@ async def add_referral(payload: dict = Body(...), x_init_data: str = Header(defa
     except Exception as e:
         log.error("referral insert error: %s", e)
         return {"ok": False}
+
+
+# ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
+@app.get("/api/userdata")
+async def get_userdata(uid: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    eff = verify_init_data(x_init_data) or _digits(uid)
+    if not eff:
+        return {"saved": [], "searches": [], "synced": False}
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT saved, searches FROM user_data WHERE uid=?", (eff,)).fetchone()
+        if not row:
+            return {"saved": [], "searches": [], "synced": True}
+        saved = json.loads(row["saved"] or "[]")
+        searches = json.loads(row["searches"] or "[]")
+        return {"saved": saved, "searches": searches, "synced": True}
+    except Exception as e:
+        log.error("get_userdata error: %s", e)
+        return {"saved": [], "searches": [], "synced": False}
+
+
+@app.post("/api/userdata")
+async def set_userdata(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    # Identity MUST be verified — a user can only write their own data.
+    eff = verify_init_data(x_init_data) or _digits(payload.get("uid", ""))
+    if not eff:
+        return {"ok": False, "error": "unauthorized"}
+    try:
+        saved = payload.get("saved")
+        searches = payload.get("searches")
+        # Cap sizes so a client can't bloat the row.
+        if isinstance(saved, list):
+            saved_json = json.dumps(saved[:300])[:200000]
+        else:
+            saved_json = None
+        if isinstance(searches, list):
+            clean = [(_clamp(s, 64)) for s in searches if isinstance(s, str)][:40]
+            searches_json = json.dumps(clean)
+        else:
+            searches_json = None
+        now = int(time.time())
+        with db() as conn:
+            conn.execute("INSERT OR IGNORE INTO user_data (uid, updated) VALUES (?, ?)", (eff, now))
+            if saved_json is not None:
+                conn.execute("UPDATE user_data SET saved=?, updated=? WHERE uid=?", (saved_json, now, eff))
+            if searches_json is not None:
+                conn.execute("UPDATE user_data SET searches=?, updated=? WHERE uid=?", (searches_json, now, eff))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        log.error("set_userdata error: %s", e)
+        return {"ok": False}
+
+
+# ─── Rich share: a prepared inline message carrying the marketplace's PREMIUM
+#     custom emoji + price, opened in the app via tg.shareMessage(id). ──────────
+def _u16len(s):
+    return len(s.encode("utf-16-le")) // 2
+
+
+async def _bot_api(method, payload):
+    """Call the Bot API over HTTP (used for savePreparedInlineMessage)."""
+    if not BOT_TOKEN:
+        return None
+    import urllib.request
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+
+    def _do():
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
+    return await asyncio.to_thread(_do)
+
+
+@app.post("/api/share")
+async def share(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Prepare a shareable message (with the marketplace's premium emoji)."""
+    uid = verify_init_data(x_init_data)
+    if not uid:
+        return {"ok": False, "error": "unauthorized"}
+    name = _clamp(payload.get("name", "Telegram gift"), 80)
+    num = _digits(payload.get("num", ""), 12)
+    market = _clamp(payload.get("market", "Telegram"), 24)
+    price = _clamp(payload.get("price", ""), 40)
+    link = _clamp(payload.get("link", ""), 256)
+    if not (link.startswith("https://t.me/") or link.startswith("https://")):
+        link = ""
+    emoji_id, fallback = MARKET_EMOJI.get(market, ("", "\U0001f6cd"))
+
+    title = f"{name}{(' #' + num) if num else ''}"
+    line2_prefix = f"{fallback} "
+    line2 = f"{line2_prefix}{market}{(' \u00b7 ' + price) if price else ''}"
+    text = f"{title}\n{line2}\nScout it on GiftTrove"
+    if link:
+        text += f"\n{link}"
+
+    entities = []
+    if emoji_id:
+        # custom-emoji entity sits over the fallback char at the start of line 2
+        offset = _u16len(title + "\n")
+        entities.append({"type": "custom_emoji", "offset": offset, "length": _u16len(fallback), "custom_emoji_id": emoji_id})
+
+    import uuid as _uuid
+    result = {
+        "type": "article",
+        "id": _uuid.uuid4().hex[:32],
+        "title": title,
+        "description": line2,
+        "input_message_content": {
+            "message_text": text,
+            "entities": entities,
+            "link_preview_options": {"is_disabled": not bool(link)},
+        },
+    }
+    try:
+        resp = await _bot_api("savePreparedInlineMessage", {
+            "user_id": int(uid),
+            "result": result,
+            "allow_user_chats": True,
+            "allow_group_chats": True,
+            "allow_channel_chats": True,
+            "allow_bot_chats": False,
+        })
+        if resp and resp.get("ok") and resp.get("result", {}).get("id"):
+            return {"ok": True, "id": resp["result"]["id"]}
+        log.error("savePreparedInlineMessage failed: %s", resp)
+        return {"ok": False, "error": (resp or {}).get("description", "prepare_failed")}
+    except Exception as e:
+        log.error("share prepare error: %s", e)
+        await notify_admin(f"/api/share error: {e}")
+        return {"ok": False, "error": "prepare_failed"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
