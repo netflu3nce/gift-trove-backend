@@ -1405,9 +1405,10 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
         link = ""
     emoji_id, fallback = MARKET_EMOJI.get(market, ("", "\U0001f6cd"))
 
+    _mid = " \u00b7 "   # middle dot separator — can't use \u inside f-string in Python 3.11
     title = f"{name}{(' #' + num) if num else ''}"
     line2_prefix = f"{fallback} "
-    line2 = f"{line2_prefix}{market}{(' \u00b7 ' + price) if price else ''}"
+    line2 = f"{line2_prefix}{market}{(_mid + price) if price else ''}"
     text = f"{title}\n{line2}\nScout it on GiftTrove"
     if link:
         text += f"\n{link}"
