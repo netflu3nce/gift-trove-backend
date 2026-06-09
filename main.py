@@ -262,13 +262,15 @@ def track_search(gift):
     if not gift:
         return
     now = int(time.time())
+    g = gift.strip()[:64]
     try:
         with db() as conn:
-            conn.execute(
-                """INSERT INTO gift_searches(gift, count, last_ts) VALUES(?,1,?)
-                   ON CONFLICT(gift) DO UPDATE SET count=count+1, last_ts=excluded.last_ts""",
-                (gift.strip()[:64], now),
-            )
+            cur = conn.execute("UPDATE gift_searches SET count=count+1, last_ts=? WHERE gift=?", (now, g))
+            if not cur.rowcount:
+                conn.execute(
+                    "INSERT INTO gift_searches(gift, count, last_ts) VALUES(?,1,?) ON CONFLICT DO NOTHING",
+                    (g, now),
+                )
             conn.execute("INSERT INTO events(kind, ts) VALUES('search', ?)", (now,))
             conn.commit()
     except Exception as e:
@@ -366,11 +368,15 @@ def _clamp(s, n=64):
     return str(s or "").strip()[:n]
 
 
-# Throttled admin DM alert when something breaks.
+# Throttled admin DM alert when something breaks. Off by default — set
+# NOTIFY_ADMIN_ERRORS=1 to receive error DMs again.
 _alert_seen = {}
+NOTIFY_ADMIN_ERRORS = os.getenv("NOTIFY_ADMIN_ERRORS", "0") == "1"
 
 
 async def notify_admin(text):
+    if not NOTIFY_ADMIN_ERRORS:
+        return
     try:
         if not bot or not ALERT_ADMIN_ID:
             return
@@ -1470,7 +1476,7 @@ async def _bot_api(method, payload):
 
 @app.post("/api/share")
 async def share(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
-    """Prepare a shareable message (with the marketplace's premium emoji)."""
+    """Prepare a clean, text-only shareable card (bold name + market + price)."""
     uid = verify_init_data(x_init_data)
     if not uid:
         return {"ok": False, "error": "unauthorized"}
@@ -1481,20 +1487,13 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
     link = _clamp(payload.get("link", ""), 256)
     if not link.startswith("https://"):
         link = ""
-    emoji_id, fallback = MARKET_EMOJI.get(market, ("", "\U0001f6cd"))
     _mid = " \u00b7 "
 
     title = f"{name}{(' #' + num) if num else ''}"
-    market_line_tail = f" {market}{(_mid + price) if price else ''}"
-
-    # Build text + entities precisely (UTF-16 offsets). Name is bold; the
-    # marketplace's PREMIUM custom emoji sits at the start of line 2.
+    # No emoji: premium custom emoji do not render in prepared inline messages
+    # (Telegram falls back to the literal char), so we keep the card clean text.
     segs = [("bold", title), ("text", "\n")]
-    if emoji_id:
-        segs.append(("emoji", fallback, emoji_id))
-        segs.append(("text", market_line_tail))
-    else:
-        segs.append(("text", f"{fallback}{market_line_tail}"))
+    segs.append(("text", f"{market}{(_mid + price) if price else ''}"))
     segs.append(("text", "\n\nScout unique Telegram gifts on GiftTrove"))
     if link:
         segs.append(("text", f"\n{link}"))
@@ -1505,8 +1504,6 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
         ln = _u16len(s)
         if seg[0] == "bold":
             entities.append({"type": "bold", "offset": off, "length": ln})
-        elif seg[0] == "emoji":
-            entities.append({"type": "custom_emoji", "offset": off, "length": ln, "custom_emoji_id": seg[2]})
         text += s
         off += ln
 
