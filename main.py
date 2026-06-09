@@ -44,7 +44,7 @@ API_HASH = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 GETGEMS_API_KEY = os.getenv("GETGEMS_API_KEY", "")
 GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://gift-trove-frontend.vercel.app").split(",") if o.strip()]
 DB_PATH = os.getenv("DB_PATH", "gifttrove.db")
 SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "100"))      # per page
 SEARCH_MAX = int(os.getenv("SEARCH_MAX", "1000"))         # hard ceiling per query
@@ -66,10 +66,30 @@ FRAGMENT_CDN = "https://nft.fragment.com/gift"
 # ─── Bot (/start handler) ─────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WELCOME_IMAGE = os.getenv("WELCOME_IMAGE", "https://i.ibb.co/5Xmf7H6b/Inria-Serif-1.png")
-WELCOME_TEXT = os.getenv(
-    "WELCOME_TEXT",
-    "**Welcome to GiftTrove! Scout unique Telegram gifts from different "
-    "marketplaces all at a go.**\n\n**GiftTrove**",
+
+# Premium custom-emoji ids (rendered in the bot's own messages via HTML).
+EMOJI_USER = "5974038293120027938"     # 👤  (start, spot 1)
+EMOJI_SEARCH = "5429571366384842791"   # 🔎  (start, spot 2)
+# Marketplace custom-emoji ids (used by the bot; also returned to the app).
+MARKET_EMOJI = {
+    "Telegram": ("5875465628285931233", "\u2708\ufe0f"),
+    "GetGems": ("5463274357008665413", "\U0001f6d2"),
+    "Portals": ("5465613787040091303", "\U0001f6d2"),
+    "MRKT": ("5465425006047564701", "\U0001f6d2"),
+    "Tonnel": ("5465531018725329021", "\U0001f6d2"),
+    "Fragment": ("5397982951369622729", "\U0001f3f4\u200d\u2620\ufe0f"),
+}
+
+WELCOME_HTML = os.getenv(
+    "WELCOME_HTML",
+    f'<emoji document-id={EMOJI_USER}>\U0001f464</emoji> <b>Welcome to GiftTrove! Scout unique '
+    f'Telegram gifts from different marketplaces all at a go.</b>\n\n'
+    f'<b>GiftTrove</b> <emoji document-id={EMOJI_SEARCH}>\U0001f50e</emoji>',
+)
+# Plain fallback if custom emoji can't be sent (still friendly).
+WELCOME_PLAIN = (
+    "\U0001f464 Welcome to GiftTrove! Scout unique Telegram gifts from different "
+    "marketplaces all at a go.\n\nGiftTrove \U0001f50e"
 )
 MINIAPP_URL = os.getenv("MINIAPP_URL", "https://t.me/gifttrovebot/app")
 COMMUNITY_URL = os.getenv("COMMUNITY_URL", "https://t.me/gifttrove")
@@ -144,6 +164,12 @@ def init_db():
                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                    kind TEXT NOT NULL, ts INTEGER NOT NULL)"""
         )
+        # Indexes — keep the analytics/referral queries fast as data grows.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ref_uid ON referrals(uid);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_members_last ON members(last_seen);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_members_visits ON members(visits);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events(kind, ts);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_gs_count ON gift_searches(count);")
         conn.commit()
 
 
@@ -207,6 +233,94 @@ def rate_ok(uid):
     return True
 
 
+# Per-IP limiter for the global middleware (one user fires several calls, so a
+# higher ceiling than the per-action limiter above).
+RATE_MAX_IP = int(os.getenv("RATE_MAX_IP", "150"))
+_rate_ip = {}
+
+
+def rate_ok_ip(ip):
+    now = time.time()
+    bucket = [t for t in _rate_ip.get(ip, []) if t > now - RATE_WINDOW]
+    if len(bucket) >= RATE_MAX_IP:
+        _rate_ip[ip] = bucket
+        return False
+    bucket.append(now)
+    _rate_ip[ip] = bucket
+    if len(_rate_ip) > 50000:
+        for k in list(_rate_ip.keys())[:10000]:
+            if not _rate_ip[k] or _rate_ip[k][-1] < now - RATE_WINDOW:
+                _rate_ip.pop(k, None)
+    return True
+
+
+# ─── Security: Telegram initData verification + strict input validation ───────
+import hmac as _hmac
+import re as _re
+from urllib.parse import parse_qsl
+
+ALERT_ADMIN_ID = os.getenv("ALERT_ADMIN_ID", "7608551523")
+_SLUG_RE = _re.compile(r"^[A-Za-z0-9._\-]{1,80}$")
+
+
+def verify_init_data(init_data):
+    """Validate Telegram Mini App initData (HMAC). Returns verified user id (str) or None."""
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        recv_hash = pairs.pop("hash", None)
+        pairs.pop("signature", None)
+        if not recv_hash:
+            return None
+        dcs = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
+        secret = _hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calc = _hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(calc, recv_hash):
+            return None
+        try:
+            if int(pairs.get("auth_date", "0")) < int(time.time()) - 86400:
+                return None  # stale (older than 24h)
+        except Exception:
+            pass
+        uid = (json.loads(pairs.get("user", "{}")) or {}).get("id")
+        return str(uid) if uid else None
+    except Exception:
+        return None
+
+
+def _digits(s, maxlen=20):
+    s = str(s or "").strip()
+    return s if s.isdigit() and 0 < len(s) <= maxlen else ""
+
+
+def _safe_slug(s):
+    s = str(s or "").strip()
+    return s if _SLUG_RE.match(s) else ""
+
+
+def _clamp(s, n=64):
+    return str(s or "").strip()[:n]
+
+
+# Throttled admin DM alert when something breaks.
+_alert_seen = {}
+
+
+async def notify_admin(text):
+    try:
+        if not bot or not ALERT_ADMIN_ID:
+            return
+        now = time.time()
+        key = (text or "")[:90]
+        if _alert_seen.get(key, 0) > now - 600:   # same alert at most once / 10 min
+            return
+        _alert_seen[key] = now
+        await asyncio.wait_for(bot.send_message(int(ALERT_ADMIN_ID), ("\u26a0\ufe0f GiftTrove alert\n\n" + str(text))[:3500]), timeout=10)
+    except Exception as e:
+        log.info("notify_admin failed: %s", e)
+
+
 # ─── Telethon client lifecycle ────────────────────────────────────────────────
 client = None
 bot = None
@@ -219,18 +333,22 @@ async def _register_bot_handlers():
 
     @bot.on(events.NewMessage(pattern=r"^/start"))
     async def _start(event):
+        buttons = [
+            [Button.url("\U0001f381 Open GiftTrove", MINIAPP_URL)],
+            [Button.url("\U0001f4ac Join Community", COMMUNITY_URL)],
+        ]
         try:
-            buttons = [
-                [Button.url("🎁 Open GiftTrove", MINIAPP_URL)],
-                [Button.url("💬 Join Community", COMMUNITY_URL)],
-            ]
-            await event.respond(WELCOME_TEXT, file=WELCOME_IMAGE, buttons=buttons)
+            await event.respond(WELCOME_HTML, file=WELCOME_IMAGE, buttons=buttons, parse_mode="html")
         except Exception as e:
-            log.error("/start failed: %s", e)
+            log.error("/start (custom emoji) failed: %s", e)
             try:
-                await event.respond(WELCOME_TEXT)
-            except Exception:
-                pass
+                await event.respond(WELCOME_PLAIN, file=WELCOME_IMAGE, buttons=buttons)
+            except Exception as e2:
+                log.error("/start fallback failed: %s", e2)
+                try:
+                    await event.respond(WELCOME_PLAIN)
+                except Exception:
+                    pass
 
 
 async def _connect_user_session():
@@ -353,9 +471,42 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS or ["*"],
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+from fastapi import Request, Header
+from fastapi.responses import JSONResponse
+
+
+@app.middleware("http")
+async def _guard(request: Request, call_next):
+    # Per-IP rate limiting on the API surface — caps abuse and runaway cost.
+    path = request.url.path
+    if path.startswith("/api/"):
+        ip = (request.headers.get("x-forwarded-for", "") or (request.client.host if request.client else "")).split(",")[0].strip() or "?"
+        if not rate_ok_ip(ip):
+            return JSONResponse(status_code=429, content={"error": "rate_limited", "results": [], "collections": []})
+    try:
+        return await call_next(request)
+    except Exception as exc:
+        # Clean fallback for the user + a detailed DM to the admin.
+        log.error("Unhandled error on %s: %s", path, exc)
+        try:
+            asyncio.create_task(notify_admin(f"{request.method} {path}\n{type(exc).__name__}: {exc}"))
+        except Exception:
+            pass
+        return JSONResponse(status_code=200, content={"error": "temporary_issue", "results": [], "collections": [], "ok": False})
+
+
+@app.exception_handler(Exception)
+async def _all_errors(request: Request, exc: Exception):
+    log.error("Handler error on %s: %s", request.url.path, exc)
+    try:
+        asyncio.create_task(notify_admin(f"{request.url.path}\n{type(exc).__name__}: {exc}"))
+    except Exception:
+        pass
+    return JSONResponse(status_code=200, content={"error": "temporary_issue", "results": [], "collections": [], "ok": False})
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -818,6 +969,9 @@ _attr_ids_cache = {}   # gift_id -> {"model": {name: AttrId}, "symbol": {...}, "
 
 @app.get("/api/attributes")
 async def attributes(gift_id: str = Query(...)):
+    gift_id = _digits(gift_id)
+    if not gift_id:
+        return {"models": [], "symbols": [], "backdrops": []}
     key = f"attrs:{gift_id}"
     cached = cache_get(key)
     if cached and str(gift_id) in _attr_ids_cache:
@@ -882,6 +1036,21 @@ async def search(
 ):
     if not rate_ok(uid):
         return {"results": [], "rate_limited": True}
+    # Strict input validation (blocks malformed / injection-style input).
+    gift = _clamp(gift, 64)
+    gift_id = _digits(gift_id)
+    slug = _safe_slug(slug)
+    num = _digits(num, 12)
+    model = _clamp(model, 80)
+    symbol = _clamp(symbol, 80)
+    backdrop = _clamp(backdrop, 80)
+    sort = "price_desc" if sort == "price_desc" else "price_asc"
+    offset = _clamp(offset, 256)
+    try:
+        min_price = max(0.0, float(min_price or 0))
+        max_price = max(0.0, float(max_price or 0))
+    except Exception:
+        min_price = max_price = 0.0
     if gift:
         track_search(gift)
 
@@ -979,6 +1148,9 @@ async def search(
 
 @app.get("/api/gift")
 async def gift(slug: str = Query(...)):
+    slug = _safe_slug(slug)
+    if not slug:
+        return {"error": "bad-slug"}
     GetUnique = _payments("GetUniqueStarGiftRequest")
     if client is None:
         return {"error": "mtproto-offline"}
@@ -1007,61 +1179,87 @@ async def gift(slug: str = Query(...)):
 
 
 @app.get("/api/access")
-async def access(uid: str = Query(""), code: str = Query("")):
+async def access(uid: str = Query(""), code: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
     """
-    Gate the app. Admins are allowed automatically; everyone else must supply
-    the access code. The code + admin list live in env vars on the server, so
-    they CANNOT be changed from the client — only the operator can rotate them.
-    Also records the (anonymous) visit for analytics on success.
+    Gate the app. Admin status comes ONLY from a verified Telegram identity
+    (signed initData) — it can't be spoofed by passing a uid. Everyone else
+    needs the access code (stored server-side; only the operator can rotate it).
     """
-    is_admin = str(uid).strip() in ADMIN_IDS
-    ok = is_admin or (code.strip() == ACCESS_CODE and ACCESS_CODE != "")
+    verified = verify_init_data(x_init_data)
+    eff_uid = verified or _digits(uid)
+    is_admin = bool(verified) and verified in ADMIN_IDS
+    ok = is_admin or (_clamp(code, 40) == ACCESS_CODE and ACCESS_CODE != "")
     if ok:
-        new_member = track_visit(uid)
+        new_member = track_visit(eff_uid)
         return {"ok": True, "admin": is_admin, "new_member": new_member}
     return {"ok": False, "admin": False}
 
 
 @app.get("/api/analytics")
-async def analytics(uid: str = Query(""), code: str = Query("")):
+async def analytics(uid: str = Query(""), code: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Admin-only product analytics. No personal data is stored or returned."""
-    if str(uid).strip() not in ADMIN_IDS and code.strip() != ACCESS_CODE:
+    verified = verify_init_data(x_init_data)
+    if not ((verified and verified in ADMIN_IDS) or _clamp(code, 40) == ACCESS_CODE):
         return {"error": "forbidden"}
     now = int(time.time())
-    day = now - 86400
-    week = now - 7 * 86400
+    day, week = now - 86400, now - 7 * 86400
     out = {}
     try:
         with db() as conn:
-            out["members_total"] = conn.execute("SELECT COUNT(*) c FROM members").fetchone()["c"]
-            out["returning_members"] = conn.execute("SELECT COUNT(*) c FROM members WHERE visits>1").fetchone()["c"]
-            out["active_24h"] = conn.execute("SELECT COUNT(*) c FROM members WHERE last_seen>?", (day,)).fetchone()["c"]
-            out["active_7d"] = conn.execute("SELECT COUNT(*) c FROM members WHERE last_seen>?", (week,)).fetchone()["c"]
-            out["new_members_24h"] = conn.execute("SELECT COUNT(*) c FROM events WHERE kind='new_member' AND ts>?", (day,)).fetchone()["c"]
-            out["searches_total"] = conn.execute("SELECT COALESCE(SUM(count),0) c FROM gift_searches").fetchone()["c"]
-            out["searches_24h"] = conn.execute("SELECT COUNT(*) c FROM events WHERE kind='search' AND ts>?", (day,)).fetchone()["c"]
-            out["opens_24h"] = conn.execute("SELECT COUNT(*) c FROM events WHERE kind IN ('open','new_member') AND ts>?", (day,)).fetchone()["c"]
-            top = conn.execute("SELECT gift, count FROM gift_searches ORDER BY count DESC LIMIT 15").fetchall()
+            q = lambda s, p=(): conn.execute(s, p).fetchone()["c"]
+            out["members_total"] = q("SELECT COUNT(*) c FROM members")
+            out["returning_members"] = q("SELECT COUNT(*) c FROM members WHERE visits>1")
+            out["active_24h"] = q("SELECT COUNT(*) c FROM members WHERE last_seen>?", (day,))
+            out["active_7d"] = q("SELECT COUNT(*) c FROM members WHERE last_seen>?", (week,))
+            out["new_members_24h"] = q("SELECT COUNT(*) c FROM events WHERE kind='new_member' AND ts>?", (day,))
+            out["new_members_7d"] = q("SELECT COUNT(*) c FROM events WHERE kind='new_member' AND ts>?", (week,))
+            out["searches_total"] = q("SELECT COALESCE(SUM(count),0) c FROM gift_searches")
+            out["searches_24h"] = q("SELECT COUNT(*) c FROM events WHERE kind='search' AND ts>?", (day,))
+            out["searches_7d"] = q("SELECT COUNT(*) c FROM events WHERE kind='search' AND ts>?", (week,))
+            out["opens_24h"] = q("SELECT COUNT(*) c FROM events WHERE kind IN ('open','new_member') AND ts>?", (day,))
+            out["opens_7d"] = q("SELECT COUNT(*) c FROM events WHERE kind IN ('open','new_member') AND ts>?", (week,))
+            out["unique_gifts"] = q("SELECT COUNT(*) c FROM gift_searches")
+            out["referrals_total"] = q("SELECT COUNT(*) c FROM referrals")
+            out["unique_referrers"] = q("SELECT COUNT(DISTINCT uid) c FROM referrals")
+            mt = out["members_total"] or 1
+            out["avg_searches_per_member"] = round((out["searches_total"] or 0) / mt, 1)
+            top = conn.execute("SELECT gift, count FROM gift_searches ORDER BY count DESC LIMIT 20").fetchall()
             out["top_searches"] = [{"gift": r["gift"], "count": r["count"]} for r in top]
+            # 7-day daily activity (oldest -> newest), no PII.
+            series = []
+            for i in range(6, -1, -1):
+                a, b = now - (i + 1) * 86400, now - i * 86400
+                series.append({
+                    "opens": q("SELECT COUNT(*) c FROM events WHERE kind IN ('open','new_member') AND ts>=? AND ts<?", (a, b)),
+                    "searches": q("SELECT COUNT(*) c FROM events WHERE kind='search' AND ts>=? AND ts<?", (a, b)),
+                    "new": q("SELECT COUNT(*) c FROM events WHERE kind='new_member' AND ts>=? AND ts<?", (a, b)),
+                })
+            out["daily"] = series
     except Exception as e:
         out["error"] = str(e)
+        await notify_admin(f"/api/analytics db error: {e}")
     return out
 
 
 @app.get("/api/referrals")
-async def referrals(uid: str = Query(...)):
-    track_visit(uid)   # opening the profile counts as a visit
+async def referrals(uid: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    eff = verify_init_data(x_init_data) or _digits(uid)
+    if not eff:
+        return {"count": 0}
+    track_visit(eff)   # opening the profile counts as a visit
     with db() as conn:
         row = conn.execute(
-            "SELECT COUNT(DISTINCT referred_by) AS n FROM referrals WHERE uid = ?", (str(uid),)
+            "SELECT COUNT(DISTINCT referred_by) AS n FROM referrals WHERE uid = ?", (eff,)
         ).fetchone()
     return {"count": int(row["n"]) if row else 0}
 
 
 @app.post("/api/referral")
-async def add_referral(payload: dict = Body(...)):
-    uid = str(payload.get("uid", "")).strip()
-    by = str(payload.get("by", "")).strip()
+async def add_referral(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    # The new user ("by") must be a verified identity where possible — you can
+    # only attribute *yourself* as referred, which blocks fake-referral abuse.
+    by = verify_init_data(x_init_data) or _digits(payload.get("by", ""))
+    uid = _digits(payload.get("uid", ""))   # the referrer
     if not uid or not by or uid == by:
         return {"ok": False}
     try:
