@@ -46,6 +46,10 @@ GETGEMS_API_KEY = os.getenv("GETGEMS_API_KEY", "")
 GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://gift-trove-frontend.vercel.app").split(",") if o.strip()]
 DB_PATH = os.getenv("DB_PATH", "gifttrove.db")
+# Durable storage: if DATABASE_URL (Postgres, e.g. Neon) is set, use it so data
+# survives redeploys. Otherwise fall back to local SQLite (ephemeral on Render).
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "100"))      # per page
 SEARCH_MAX = int(os.getenv("SEARCH_MAX", "1000"))         # hard ceiling per query
 MTPROTO_TIMEOUT = int(os.getenv("MTPROTO_TIMEOUT", "18"))   # seconds per call
@@ -88,8 +92,8 @@ WELCOME_HTML = os.getenv(
 )
 # Plain fallback if custom emoji can't be sent (still friendly).
 WELCOME_PLAIN = (
-    "\U0001f464 Welcome to GiftTrove! Scout unique Telegram gifts from different "
-    "marketplaces all at a go.\n\nGiftTrove \U0001f50e"
+    "Welcome to GiftTrove! Scout unique Telegram gifts from different "
+    "marketplaces all at a go.\n\nGiftTrove"
 )
 MINIAPP_URL = os.getenv("MINIAPP_URL", "https://t.me/gifttrovebot/app")
 COMMUNITY_URL = os.getenv("COMMUNITY_URL", "https://t.me/gifttrove")
@@ -121,11 +125,53 @@ def cache_set(key, val, ttl):
 # See the scaling notes at the bottom of this file.
 import hashlib
 
+if USE_PG:
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except Exception as _pg_err:
+        logging.getLogger("gifttrove").error("psycopg unavailable (%s) — using SQLite", _pg_err)
+        USE_PG = False
+
+
+class _DB:
+    """Uniform wrapper over psycopg / sqlite3: dict rows + '?' placeholders."""
+
+    def __init__(self):
+        if USE_PG:
+            self._c = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
+        else:
+            self._c = sqlite3.connect(DB_PATH)
+            self._c.row_factory = sqlite3.Row
+
+    def execute(self, sql, params=()):
+        if USE_PG:
+            return self._c.execute(sql.replace("?", "%s"), tuple(params))
+        return self._c.execute(sql, params)
+
+    def commit(self):
+        self._c.commit()
+
+    def close(self):
+        try:
+            self._c.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, et, ev, tb):
+        try:
+            if et is None:
+                self._c.commit()
+        except Exception:
+            pass
+        self.close()
+
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return _DB()
 
 
 def _uid_hash(uid):
@@ -137,7 +183,8 @@ def _uid_hash(uid):
 
 def init_db():
     with db() as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
+        if not USE_PG:
+            conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute(
             """CREATE TABLE IF NOT EXISTS referrals (
                    uid TEXT NOT NULL, referred_by TEXT NOT NULL, ts INTEGER NOT NULL,
@@ -158,12 +205,17 @@ def init_db():
                    count INTEGER NOT NULL DEFAULT 0,
                    last_ts INTEGER NOT NULL)"""
         )
-        # Lightweight event log (daily rollups are derived from this).
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS events (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   kind TEXT NOT NULL, ts INTEGER NOT NULL)"""
-        )
+        # Lightweight event log (rollups are derived from this).
+        if USE_PG:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS events (
+                       id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL, ts INTEGER NOT NULL)"""
+            )
+        else:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS events (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, ts INTEGER NOT NULL)"""
+            )
         # Per-user activity so saved gifts + recent searches follow the user
         # across devices. Keyed by the verified Telegram id; saved/searches are
         # JSON blobs. (Referrals already sync via the referrals table.)
@@ -181,6 +233,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events(kind, ts);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_gs_count ON gift_searches(count);")
         conn.commit()
+    log.info("DB ready (%s)", "Postgres" if USE_PG else "SQLite")
 
 
 def track_visit(uid):
@@ -326,7 +379,7 @@ async def notify_admin(text):
         if _alert_seen.get(key, 0) > now - 600:   # same alert at most once / 10 min
             return
         _alert_seen[key] = now
-        await asyncio.wait_for(bot.send_message(int(ALERT_ADMIN_ID), ("\u26a0\ufe0f GiftTrove alert\n\n" + str(text))[:3500]), timeout=10)
+        await asyncio.wait_for(bot.send_message(int(ALERT_ADMIN_ID), ("GiftTrove alert\n\n" + str(text))[:3500]), timeout=10)
     except Exception as e:
         log.info("notify_admin failed: %s", e)
 
@@ -344,8 +397,8 @@ async def _register_bot_handlers():
     @bot.on(events.NewMessage(pattern=r"^/start"))
     async def _start(event):
         buttons = [
-            [Button.url("\U0001f381 Open GiftTrove", MINIAPP_URL)],
-            [Button.url("\U0001f4ac Join Community", COMMUNITY_URL)],
+            [Button.url("Open GiftTrove", MINIAPP_URL)],
+            [Button.url("Join Community", COMMUNITY_URL)],
         ]
         # Build the message with explicit entities so the PREMIUM custom emoji
         # render (the bot may use them because the owner has Telegram Premium).
@@ -1238,11 +1291,13 @@ async def access(uid: str = Query(""), code: str = Query(""), x_init_data: str =
 
 
 @app.get("/api/analytics")
-async def analytics(uid: str = Query(""), code: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+async def analytics(uid: str = Query(""), code: str = Query(""), range_q: str = Query("7d", alias="range"),
+                    x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Admin-only product analytics. No personal data is stored or returned."""
     verified = verify_init_data(x_init_data)
     if not ((verified and verified in ADMIN_IDS) or _clamp(code, 40) == ACCESS_CODE):
         return {"error": "forbidden"}
+    rng = range_q if range_q in ("7d", "12w", "24m", "all") else "7d"
     now = int(time.time())
     day, week = now - 86400, now - 7 * 86400
     out = {}
@@ -1267,16 +1322,39 @@ async def analytics(uid: str = Query(""), code: str = Query(""), x_init_data: st
             out["avg_searches_per_member"] = round((out["searches_total"] or 0) / mt, 1)
             top = conn.execute("SELECT gift, count FROM gift_searches ORDER BY count DESC LIMIT 20").fetchall()
             out["top_searches"] = [{"gift": r["gift"], "count": r["count"]} for r in top]
-            # 7-day daily activity (oldest -> newest), no PII.
-            series = []
-            for i in range(6, -1, -1):
-                a, b = now - (i + 1) * 86400, now - i * 86400
-                series.append({
-                    "opens": q("SELECT COUNT(*) c FROM events WHERE kind IN ('open','new_member') AND ts>=? AND ts<?", (a, b)),
-                    "searches": q("SELECT COUNT(*) c FROM events WHERE kind='search' AND ts>=? AND ts<?", (a, b)),
-                    "new": q("SELECT COUNT(*) c FROM events WHERE kind='new_member' AND ts>=? AND ts<?", (a, b)),
-                })
-            out["daily"] = series
+
+            # ── activity series for the requested range (single query) ──
+            cfg = {"7d": (7, 86400), "12w": (12, 7 * 86400), "24m": (24, 30 * 86400)}
+            if rng == "all":
+                row = conn.execute("SELECT MIN(ts) m FROM events").fetchone()
+                first = int((row and row["m"]) or (now - 86400))
+                span = max(now - first, 86400)
+                n = 24
+                size = max(86400, span // n)
+            else:
+                n, size = cfg[rng]
+            start = now - n * size
+            rows = conn.execute("SELECT kind, ts FROM events WHERE ts >= ?", (start,)).fetchall()
+            buckets = [{"opens": 0, "searches": 0, "new": 0} for _ in range(n)]
+            for r in rows:
+                idx = int((int(r["ts"]) - start) // size)
+                if idx < 0 or idx >= n:
+                    continue
+                k = r["kind"]
+                if k == "search":
+                    buckets[idx]["searches"] += 1
+                elif k == "new_member":
+                    buckets[idx]["new"] += 1
+                    buckets[idx]["opens"] += 1
+                elif k == "open":
+                    buckets[idx]["opens"] += 1
+            fmt = "%b %d" if size <= 9 * 86400 else "%b %y"
+            labels = [time.strftime(fmt, time.gmtime(start + (i + 1) * size - 1)) for i in range(n)]
+            out["daily"] = buckets
+            out["labels"] = labels
+            out["range"] = rng
+            out["range_start"] = time.strftime("%b %d, %Y", time.gmtime(start))
+            out["range_end"] = time.strftime("%b %d, %Y", time.gmtime(now))
     except Exception as e:
         out["error"] = str(e)
         await notify_admin(f"/api/analytics db error: {e}")
@@ -1307,7 +1385,7 @@ async def add_referral(payload: dict = Body(...), x_init_data: str = Header(defa
     try:
         with db() as conn:
             conn.execute(
-                "INSERT OR IGNORE INTO referrals (uid, referred_by, ts) VALUES (?, ?, ?)",
+                "INSERT INTO referrals (uid, referred_by, ts) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
                 (uid, by, int(time.time())),
             )
             conn.commit()
@@ -1357,7 +1435,7 @@ async def set_userdata(payload: dict = Body(...), x_init_data: str = Header(defa
             searches_json = None
         now = int(time.time())
         with db() as conn:
-            conn.execute("INSERT OR IGNORE INTO user_data (uid, updated) VALUES (?, ?)", (eff, now))
+            conn.execute("INSERT INTO user_data (uid, updated) VALUES (?, ?) ON CONFLICT DO NOTHING", (eff, now))
             if saved_json is not None:
                 conn.execute("UPDATE user_data SET saved=?, updated=? WHERE uid=?", (saved_json, now, eff))
             if searches_json is not None:
@@ -1401,30 +1479,43 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
     market = _clamp(payload.get("market", "Telegram"), 24)
     price = _clamp(payload.get("price", ""), 40)
     link = _clamp(payload.get("link", ""), 256)
-    if not (link.startswith("https://t.me/") or link.startswith("https://")):
+    if not link.startswith("https://"):
         link = ""
     emoji_id, fallback = MARKET_EMOJI.get(market, ("", "\U0001f6cd"))
+    _mid = " \u00b7 "
 
-    _mid = " \u00b7 "   # middle dot separator — can't use \u inside f-string in Python 3.11
     title = f"{name}{(' #' + num) if num else ''}"
-    line2_prefix = f"{fallback} "
-    line2 = f"{line2_prefix}{market}{(_mid + price) if price else ''}"
-    text = f"{title}\n{line2}\nScout it on GiftTrove"
-    if link:
-        text += f"\n{link}"
+    market_line_tail = f" {market}{(_mid + price) if price else ''}"
 
-    entities = []
+    # Build text + entities precisely (UTF-16 offsets). Name is bold; the
+    # marketplace's PREMIUM custom emoji sits at the start of line 2.
+    segs = [("bold", title), ("text", "\n")]
     if emoji_id:
-        # custom-emoji entity sits over the fallback char at the start of line 2
-        offset = _u16len(title + "\n")
-        entities.append({"type": "custom_emoji", "offset": offset, "length": _u16len(fallback), "custom_emoji_id": emoji_id})
+        segs.append(("emoji", fallback, emoji_id))
+        segs.append(("text", market_line_tail))
+    else:
+        segs.append(("text", f"{fallback}{market_line_tail}"))
+    segs.append(("text", "\n\nScout unique Telegram gifts on GiftTrove"))
+    if link:
+        segs.append(("text", f"\n{link}"))
+
+    text, off, entities = "", 0, []
+    for seg in segs:
+        s = seg[1]
+        ln = _u16len(s)
+        if seg[0] == "bold":
+            entities.append({"type": "bold", "offset": off, "length": ln})
+        elif seg[0] == "emoji":
+            entities.append({"type": "custom_emoji", "offset": off, "length": ln, "custom_emoji_id": seg[2]})
+        text += s
+        off += ln
 
     import uuid as _uuid
     result = {
         "type": "article",
         "id": _uuid.uuid4().hex[:32],
         "title": title,
-        "description": line2,
+        "description": (market + (_mid + price if price else "")).strip(),
         "input_message_content": {
             "message_text": text,
             "entities": entities,
@@ -1440,13 +1531,15 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
             "allow_channel_chats": True,
             "allow_bot_chats": False,
         })
-        if resp and resp.get("ok") and resp.get("result", {}).get("id"):
+        if resp and resp.get("ok") and (resp.get("result") or {}).get("id"):
             return {"ok": True, "id": resp["result"]["id"]}
+        desc = (resp or {}).get("description", "prepare_failed")
         log.error("savePreparedInlineMessage failed: %s", resp)
-        return {"ok": False, "error": (resp or {}).get("description", "prepare_failed")}
+        await notify_admin(f"/api/share rejected: {desc}")
+        return {"ok": False, "error": desc}
     except Exception as e:
         log.error("share prepare error: %s", e)
-        await notify_admin(f"/api/share error: {e}")
+        await notify_admin(f"/api/share error: {type(e).__name__}: {e}")
         return {"ok": False, "error": "prepare_failed"}
 
 
