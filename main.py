@@ -53,7 +53,7 @@ MTPROTO_TIMEOUT = int(os.getenv("MTPROTO_TIMEOUT", "18"))   # seconds per call
 # ─── Access gate ──────────────────────────────────────────────────────────────
 # Admins bypass automatically; everyone else needs the access code. BOTH live in
 # env vars so only the operator can change them (never hard-coded in the client).
-ADMIN_IDS = {s.strip() for s in os.getenv("ADMIN_IDS", "7608551523").split(",") if s.strip()}
+ADMIN_IDS = {s.strip() for s in os.getenv("ADMIN_IDS", "7608551523,8124847664").split(",") if s.strip()}
 ACCESS_CODE = os.getenv("ACCESS_CODE", "8f70p").strip()
 
 # ─── Rate limiting (protects the backend from abuse / accidental hammering) ────
@@ -221,8 +221,8 @@ async def _register_bot_handlers():
     async def _start(event):
         try:
             buttons = [
-                [Button.url(" Open GiftTrove", MINIAPP_URL)],
-                [Button.url(" Join Community", COMMUNITY_URL)],
+                [Button.url("🎁 Open GiftTrove", MINIAPP_URL)],
+                [Button.url("💬 Join Community", COMMUNITY_URL)],
             ]
             await event.respond(WELCOME_TEXT, file=WELCOME_IMAGE, buttons=buttons)
         except Exception as e:
@@ -408,6 +408,67 @@ def color_hex(c):
         return None
 
 
+# Expand a Telegram "stripped" thumbnail (photoStrippedSize.bytes) into a real
+# JPEG, returned as a data URI. This needs NO file download / getFile call, so
+# it's instant and never triggers flood waits — perfect for picker thumbnails.
+_JPEG_HEADER = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb004300281c1e231e19282321232d2b"
+    "28303c64413c37373c7b585d4964918099968f808c8aa0b4e6c3a0aadaad8a8cc8ffcbdaee"
+    "f5ffffff9bc1fffffffaffe6fdfff8ffdb0043012b2d2d3c353c76414176f8a58ca5f8f8f8"
+    "f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8"
+    "f8f8f8f8f8f8f8f8f8f8f8f8ffc00011080000000003012200021101031101ffc4001f0000"
+    "010501010101010100000000000000000102030405060708090a0bffc400b5100002010303"
+    "020403050504040000017d01020300041105122131410613516107227114328191a1082342"
+    "b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748"
+    "494a535455565758595a636465666768696a737475767778797a838485868788898a929394"
+    "95969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6"
+    "d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffc4001f0100030101010101010"
+    "1010100000000000000010203040506070809ffc400b5110002010204040304070504040001"
+    "0277000102031104052131061241510761711322328108144291a1b1c109233352f0156272"
+    "d10a162434e125f11718191a262728292a35363738393a434445464748494a535455565758"
+    "595a636465666768696a737475767778797a82838485868788898a92939495969798999aa2"
+    "a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4"
+    "e5e6e7e8e9eaf2f3f4f5f6f7f8f9faffda000c03010002110311003f00"
+)
+_JPEG_FOOTER = bytes.fromhex("ffd9")
+
+
+def _stripped_data_uri(doc):
+    """Find a stripped thumbnail on a Document and return it as a data URI."""
+    try:
+        import base64 as _b64
+        thumbs = getattr(doc, "thumbs", None) or []
+        for th in thumbs:
+            b = getattr(th, "bytes", None)
+            if b and len(b) >= 3 and b[0] == 0x01:
+                real = bytearray(_JPEG_HEADER)
+                real[164] = b[1]
+                real[166] = b[2]
+                jpg = bytes(real) + bytes(b[3:]) + _JPEG_FOOTER
+                return "data:image/jpeg;base64," + _b64.b64encode(jpg).decode()
+    except Exception:
+        pass
+    return None
+
+
+def _attr_id(a):
+    """Build the StarGiftAttributeId used for server-side resale filtering."""
+    cls = type(a).__name__
+    try:
+        if cls == "StarGiftAttributeModel":
+            doc_id = getattr(getattr(a, "document", None), "id", None)
+            return types.StarGiftAttributeIdModel(document_id=int(doc_id)) if doc_id else None
+        if cls == "StarGiftAttributePattern":
+            doc_id = getattr(getattr(a, "document", None), "id", None)
+            return types.StarGiftAttributeIdPattern(document_id=int(doc_id)) if doc_id else None
+        if cls == "StarGiftAttributeBackdrop":
+            bid = getattr(a, "backdrop_id", None)
+            return types.StarGiftAttributeIdBackdrop(backdrop_id=int(bid)) if bid is not None else None
+    except Exception as e:
+        log.info("attr_id build failed (%s): %s", cls, e)
+    return None
+
+
 def cdn_full(slug, num):
     base = (slug or "").strip()
     if num is not None and not base.lower().endswith(f"-{num}".lower()):
@@ -441,6 +502,7 @@ def _extract_price(g):
     """
     stars = None
     gram = None
+    ton_only = bool(getattr(g, "resale_ton_only", False))
     amounts = getattr(g, "resell_amount", None)
     if amounts is None:
         amounts = []
@@ -457,6 +519,9 @@ def _extract_price(g):
             nanos = getattr(a, "nanos", 0) or 0
             val = int(amt) + (int(nanos) / 1e9)
             stars = int(val) if float(val).is_integer() else round(val, 2)
+    # Some sellers list TON-only (can't be bought with Stars) -> price is GRAM.
+    if ton_only and gram is not None:
+        return (gram, "GRAM")
     if stars is not None:
         return (stars, "Stars")
     if gram is not None:
@@ -673,7 +738,7 @@ async def collections():
                 "slug": getattr(g, "slug", None) or _slug_from_title(title),
                 "gift_id": str(getattr(g, "id", "") or ""),
                 "supply": getattr(g, "availability_total", None) or getattr(g, "availability_issued", None) or 0,
-                "preview": "",
+                "preview": _stripped_data_uri(getattr(g, "sticker", None)) or "",
             })
         out = [c for c in out if c["gift_id"]]
         cache_set("collections", out, ttl=900)
@@ -748,11 +813,14 @@ async def featured():
             return {"gifts": []}
 
 
+_attr_ids_cache = {}   # gift_id -> {"model": {name: AttrId}, "symbol": {...}, "backdrop": {...}}
+
+
 @app.get("/api/attributes")
 async def attributes(gift_id: str = Query(...)):
     key = f"attrs:{gift_id}"
     cached = cache_get(key)
-    if cached:
+    if cached and str(gift_id) in _attr_ids_cache:
         return cached
     empty = {"models": [], "symbols": [], "backdrops": []}
     GetResale = _payments("GetResaleStarGiftsRequest")
@@ -763,17 +831,30 @@ async def attributes(gift_id: str = Query(...)):
     try:
         res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0, offset="", limit=1))
         models, symbols, backdrops = [], [], []
+        id_map = {"model": {}, "symbol": {}, "backdrop": {}}
         for a in getattr(res, "attributes", []) or []:
             cls = type(a).__name__
             name = getattr(a, "name", None)
             rar = getattr(a, "rarity_permille", None)
             rar = round(rar / 10, 2) if isinstance(rar, (int, float)) else None
+            aid = _attr_id(a)
             if cls == "StarGiftAttributeModel":
-                models.append({"name": name, "rarity": rar})
+                models.append({"name": name, "rarity": rar, "img": _stripped_data_uri(getattr(a, "document", None))})
+                if name and aid is not None:
+                    id_map["model"][name] = aid
             elif cls == "StarGiftAttributePattern":
-                symbols.append({"name": name, "rarity": rar})
+                symbols.append({"name": name, "rarity": rar, "img": _stripped_data_uri(getattr(a, "document", None))})
+                if name and aid is not None:
+                    id_map["symbol"][name] = aid
             elif cls == "StarGiftAttributeBackdrop":
-                backdrops.append({"name": name, "hex": color_hex(getattr(a, "center_color", None)), "rarity": rar})
+                backdrops.append({
+                    "name": name, "rarity": rar,
+                    "hex": color_hex(getattr(a, "center_color", None)),
+                    "edge": color_hex(getattr(a, "edge_color", None)),
+                })
+                if name and aid is not None:
+                    id_map["backdrop"][name] = aid
+        _attr_ids_cache[str(gift_id)] = id_map
         result = {"models": models, "symbols": symbols, "backdrops": backdrops}
         cache_set(key, result, ttl=900)
         return result
@@ -810,6 +891,24 @@ async def search(
     limit = max(1, min(int(limit or SEARCH_LIMIT), SEARCH_MAX))
     GetResale = _payments("GetResaleStarGiftsRequest")
 
+    # Resolve selected model/symbol/backdrop NAMES to attribute IDs so Telegram
+    # filters server-side (otherwise matches on deeper pages get missed -> the
+    # false "no listings" bug). Ensure the id map for this gift is populated.
+    if gift_id and (model or symbol or backdrop) and str(gift_id) not in _attr_ids_cache:
+        try:
+            await attributes(gift_id=str(gift_id))
+        except Exception:
+            pass
+    ids = _attr_ids_cache.get(str(gift_id), {})
+    attr_filter = []
+    srv_model = srv_symbol = srv_backdrop = False
+    if model and ids.get("model", {}).get(model) is not None:
+        attr_filter.append(ids["model"][model]); srv_model = True
+    if symbol and ids.get("symbol", {}).get(symbol) is not None:
+        attr_filter.append(ids["symbol"][symbol]); srv_symbol = True
+    if backdrop and ids.get("backdrop", {}).get(backdrop) is not None:
+        attr_filter.append(ids["backdrop"][backdrop]); srv_backdrop = True
+
     if client is not None and GetResale and gift_id and (not want or "Telegram" in want):
         try:
             cur = offset or ""
@@ -823,6 +922,7 @@ async def search(
                 res = await _invoke(lambda c=cur, p=page: GetResale(
                     gift_id=int(gift_id), attributes_hash=0,
                     sort_by_price=(sort != "price_desc"),
+                    attributes=(attr_filter or None),
                     offset=c, limit=p,
                 ))
                 chunk = getattr(res, "gifts", []) or []
@@ -830,11 +930,13 @@ async def search(
                     item = serialize_unique(g)
                     if num and str(item.get("num")) != str(num):
                         continue
-                    if model and (item.get("model") or "").lower() != model.lower():
+                    # Fallback client-side filter only for attributes Telegram
+                    # didn't already filter for us (e.g. id couldn't be resolved).
+                    if model and not srv_model and (item.get("model") or "").lower() != model.lower():
                         continue
-                    if symbol and (item.get("symbol") or "").lower() != symbol.lower():
+                    if symbol and not srv_symbol and (item.get("symbol") or "").lower() != symbol.lower():
                         continue
-                    if backdrop and (item.get("backdrop") or "").lower() != backdrop.lower():
+                    if backdrop and not srv_backdrop and (item.get("backdrop") or "").lower() != backdrop.lower():
                         continue
                     results.append(item)
                 fetched += len(chunk)
