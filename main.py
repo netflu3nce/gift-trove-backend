@@ -217,6 +217,15 @@ def init_db():
             """CREATE TABLE IF NOT EXISTS meta (
                    key TEXT PRIMARY KEY, val TEXT NOT NULL)"""
         )
+        # Durable per-gift attributes cache (models/symbols/backdrops + images)
+        # so restarts don't cause slow or empty attribute loads. Capped to the
+        # most recently used gifts to bound storage.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS attrs_cache (
+                   gift_id TEXT PRIMARY KEY,
+                   payload TEXT NOT NULL,
+                   ts INTEGER NOT NULL)"""
+        )
         # Lightweight event log (rollups are derived from this).
         if USE_PG:
             conn.execute(
@@ -1134,47 +1143,109 @@ async def debug():
     return info
 
 
+_collections_lock = asyncio.Lock()
+_collections_refreshing = False
+
+
+def _collections_db_get():
+    try:
+        raw = _meta_get("collections_cache", "")
+        if raw:
+            data = json.loads(raw)
+            if isinstance(data, list) and data:
+                return data
+    except Exception as e:
+        log.info("collections db read skipped: %s", e)
+    return None
+
+
+def _collections_db_set(out):
+    try:
+        blob = json.dumps(out)
+        if len(blob) < 4_000_000:   # safety: never store a runaway blob
+            _meta_set("collections_cache", blob)
+    except Exception as e:
+        log.info("collections db write skipped: %s", e)
+
+
+async def _build_collections():
+    """Fetch the catalog + real preview thumbs. Slow on a cold process."""
+    GetStarGifts = _payments("GetStarGiftsRequest")
+    res = await _invoke(lambda: GetStarGifts(hash=0))
+    raw = getattr(res, "gifts", []) or []
+    keep = []
+    for g in raw:
+        title = getattr(g, "title", None)
+        # Skip gifts with no real name — those un-named "Gift <id>" entries
+        # are non-collectible/parked star gifts and only add noise.
+        if not title or not str(title).strip():
+            continue
+        keep.append((str(title).strip(), g))
+    previews = await asyncio.gather(
+        *[_doc_thumb_uri(getattr(g, "sticker", None)) for _, g in keep],
+        return_exceptions=True,
+    )
+    out = []
+    for (title, g), pv in zip(keep, previews):
+        out.append({
+            "name": title,
+            "slug": getattr(g, "slug", None) or _slug_from_title(title),
+            "gift_id": str(getattr(g, "id", "") or ""),
+            "supply": getattr(g, "availability_total", None) or getattr(g, "availability_issued", None) or 0,
+            "preview": (pv if isinstance(pv, str) else None) or "",
+        })
+    return [c for c in out if c["gift_id"]]
+
+
+async def _refresh_collections_bg():
+    """Background rebuild → memory + durable Postgres copy."""
+    global _collections_refreshing
+    if _collections_refreshing:
+        return
+    _collections_refreshing = True
+    try:
+        out = await _build_collections()
+        if out:
+            cache_set("collections", out, ttl=900)
+            _collections_db_set(out)
+            log.info("collections refreshed (%d items)", len(out))
+    except Exception as e:
+        log.info("collections bg refresh skipped: %s", e)
+    finally:
+        _collections_refreshing = False
+
+
 @app.get("/api/collections")
 async def collections():
     cached = cache_get("collections")
     if cached:
         return {"collections": cached}
-    GetStarGifts = _payments("GetStarGiftsRequest")
     if client is None:
         return {"collections": [], "error": "MTProto background sync still initialising."}
-    if not GetStarGifts:
+    if not _payments("GetStarGiftsRequest"):
         return {"collections": [], "error": "GetStarGiftsRequest missing — pip install -U telethon"}
-    try:
-        res = await _invoke(lambda: GetStarGifts(hash=0))
-        raw = getattr(res, "gifts", []) or []
-        keep = []
-        for g in raw:
-            title = getattr(g, "title", None)
-            # Skip gifts with no real name — those un-named "Gift <id>" entries
-            # are non-collectible/parked star gifts and only add noise.
-            if not title or not str(title).strip():
-                continue
-            keep.append((str(title).strip(), g))
-        # Real preview images, fetched in parallel (cached after first run).
-        previews = await asyncio.gather(
-            *[_doc_thumb_uri(getattr(g, "sticker", None)) for _, g in keep],
-            return_exceptions=True,
-        )
-        out = []
-        for (title, g), pv in zip(keep, previews):
-            out.append({
-                "name": title,
-                "slug": getattr(g, "slug", None) or _slug_from_title(title),
-                "gift_id": str(getattr(g, "id", "") or ""),
-                "supply": getattr(g, "availability_total", None) or getattr(g, "availability_issued", None) or 0,
-                "preview": (pv if isinstance(pv, str) else None) or "",
-            })
-        out = [c for c in out if c["gift_id"]]
-        cache_set("collections", out, ttl=900)
-        return {"collections": out, "_raw_count": len(raw)}
-    except Exception as e:
-        log.error("collections error: %s", e)
-        return {"collections": [], "error": str(e)}
+    # RESTART-PROOF PATH: a fresh process serves the durable Postgres copy
+    # instantly (no 100+ image downloads inside the request) and refreshes
+    # in the background. This is what keeps suggestions + the floating gifts
+    # alive right after every deploy.
+    db_copy = _collections_db_get()
+    if db_copy:
+        cache_set("collections", db_copy, ttl=900)
+        asyncio.get_event_loop().create_task(_refresh_collections_bg())
+        return {"collections": db_copy, "_served": "durable"}
+    # First boot ever (no durable copy yet): build inline, single-flight.
+    async with _collections_lock:
+        cached = cache_get("collections")
+        if cached:
+            return {"collections": cached}
+        try:
+            out = await _build_collections()
+            cache_set("collections", out, ttl=900)
+            _collections_db_set(out)
+            return {"collections": out}
+        except Exception as e:
+            log.error("collections error: %s", e)
+            return {"collections": [], "error": str(e)}
 
 
 @app.get("/api/featured")
@@ -1246,6 +1317,38 @@ _attr_ids_cache = {}   # gift_id -> {"model": {name: AttrId}, "symbol": {...}, "
 _attrs_stale = {}      # gift_id -> last good /api/attributes payload (stale-ok fallback)
 
 
+def _attrs_db_get(gift_id):
+    try:
+        with db() as conn:
+            r = conn.execute("SELECT payload, ts FROM attrs_cache WHERE gift_id=?", (str(gift_id),)).fetchone()
+            if r:
+                return json.loads(r["payload"]), int(r["ts"])
+    except Exception as e:
+        log.info("attrs db read skipped: %s", e)
+    return None, 0
+
+
+def _attrs_db_set(gift_id, payload):
+    try:
+        blob = json.dumps(payload)
+        if len(blob) > 3_000_000:
+            return
+        now = int(time.time())
+        with db() as conn:
+            cur = conn.execute("UPDATE attrs_cache SET payload=?, ts=? WHERE gift_id=?", (blob, now, str(gift_id)))
+            if not cur.rowcount:
+                conn.execute("INSERT INTO attrs_cache(gift_id, payload, ts) VALUES(?,?,?) ON CONFLICT DO NOTHING",
+                             (str(gift_id), blob, now))
+            # Bound storage: keep only the 40 most recently used gifts.
+            conn.execute(
+                "DELETE FROM attrs_cache WHERE gift_id NOT IN "
+                "(SELECT gift_id FROM attrs_cache ORDER BY ts DESC LIMIT 40)"
+            )
+            conn.commit()
+    except Exception as e:
+        log.info("attrs db write skipped: %s", e)
+
+
 @app.get("/api/attributes")
 async def attributes(gift_id: str = Query(...)):
     gift_id = _digits(gift_id)
@@ -1255,6 +1358,16 @@ async def attributes(gift_id: str = Query(...)):
     cached = cache_get(key)
     if cached and str(gift_id) in _attr_ids_cache:
         return cached
+    # RESTART-PROOF PATH: durable Postgres copy (response + attribute-id map)
+    # serves instantly after a deploy; live fetch only when no usable copy.
+    db_payload, db_ts = _attrs_db_get(gift_id)
+    if db_payload and isinstance(db_payload, dict) and db_payload.get("resp") and (time.time() - db_ts) < 7 * 86400:
+        if db_payload.get("ids"):
+            _attr_ids_cache[str(gift_id)] = db_payload["ids"]
+        resp = db_payload["resp"]
+        cache_set(key, resp, ttl=21600)
+        _attrs_stale[str(gift_id)] = resp
+        return resp
     empty = {"models": [], "symbols": [], "backdrops": []}
     GetResale = _payments("GetResaleStarGiftsRequest")
     if client is None:
@@ -1305,14 +1418,20 @@ async def attributes(gift_id: str = Query(...)):
         result = {"models": models, "symbols": symbols, "backdrops": backdrops}
         cache_set(key, result, ttl=21600)          # attributes barely change — 6h
         _attrs_stale[str(gift_id)] = result        # long-lived safety copy
+        _attrs_db_set(gift_id, {"resp": result, "ids": id_map})   # survives restarts
         return result
     except Exception as e:
         log.error("attributes error: %s", e)
-        # Transient MTProto hiccup (flood-wait/timeout): serve the last good
-        # copy instead of an empty list, so the UI never shows just "Any".
+        # Transient MTProto hiccup: serve the last good copy (memory, then
+        # durable DB, any age) instead of an empty list — never just "Any".
         stale = _attrs_stale.get(str(gift_id))
         if stale:
             return stale
+        db_payload, _ = _attrs_db_get(gift_id)
+        if db_payload and isinstance(db_payload, dict) and db_payload.get("resp"):
+            if db_payload.get("ids"):
+                _attr_ids_cache[str(gift_id)] = db_payload["ids"]
+            return db_payload["resp"]
         return {**empty, "error": str(e)}
 
 
@@ -1686,6 +1805,26 @@ async def _bot_api(method, payload):
         with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read().decode())
     return await asyncio.to_thread(_do)
+
+
+@app.post("/api/userdata/clear")
+async def userdata_clear(x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Self-serve data deletion: wipes the caller's synced data + referral rows.
+    Identity comes ONLY from Telegram's signed initData, so a user can never
+    clear anyone else's data. Aggregate anonymous counters are untouched."""
+    uid = verify_init_data(x_init_data)
+    if not uid or not rate_ok(uid):
+        return {"ok": False}
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM user_data WHERE uid=?", (str(uid),))
+            conn.execute("DELETE FROM referrals WHERE uid=?", (str(uid),))
+            conn.execute("DELETE FROM members WHERE uid_hash=?", (_uid_hash(uid),))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        log.error("userdata clear error: %s", e)
+        return {"ok": False}
 
 
 @app.post("/api/share/track")
