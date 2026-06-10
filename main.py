@@ -1674,6 +1674,16 @@ async def _bot_api(method, payload):
     return await asyncio.to_thread(_do)
 
 
+@app.post("/api/share/track")
+async def share_track(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Count a share that went through the plain share sheet (fallback path)."""
+    uid = verify_init_data(x_init_data)
+    if not uid or not rate_ok(uid):
+        return {"ok": False}
+    track_share(_clamp(payload.get("name", ""), 64))
+    return {"ok": True}
+
+
 @app.post("/api/share")
 async def share(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Prepare a clean, text-only shareable card (bold name + market + price)."""
