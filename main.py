@@ -205,6 +205,18 @@ def init_db():
                    count INTEGER NOT NULL DEFAULT 0,
                    last_ts INTEGER NOT NULL)"""
         )
+        # Aggregated SHARE counts per gift collection (no user linkage).
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS gift_shares (
+                   gift TEXT PRIMARY KEY,
+                   count INTEGER NOT NULL DEFAULT 0,
+                   last_ts INTEGER NOT NULL)"""
+        )
+        # Tiny key/value store (e.g. last daily-digest timestamp).
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS meta (
+                   key TEXT PRIMARY KEY, val TEXT NOT NULL)"""
+        )
         # Lightweight event log (rollups are derived from this).
         if USE_PG:
             conn.execute(
@@ -275,6 +287,26 @@ def track_search(gift):
             conn.commit()
     except Exception as e:
         log.info("track_search skipped: %s", e)
+
+
+def track_share(gift):
+    """Count a successful share of a gift collection (Postgres-safe upsert)."""
+    if not gift:
+        return
+    now = int(time.time())
+    g = str(gift).strip()[:64]
+    try:
+        with db() as conn:
+            cur = conn.execute("UPDATE gift_shares SET count=count+1, last_ts=? WHERE gift=?", (now, g))
+            if not cur.rowcount:
+                conn.execute(
+                    "INSERT INTO gift_shares(gift, count, last_ts) VALUES(?,1,?) ON CONFLICT DO NOTHING",
+                    (g, now),
+                )
+            conn.execute("INSERT INTO events(kind, ts) VALUES('share', ?)", (now,))
+            conn.commit()
+    except Exception as e:
+        log.info("track_share skipped: %s", e)
 
 
 # ─── In-memory rate limiter (per hashed client, sliding window) ───────────────
@@ -368,14 +400,15 @@ def _clamp(s, n=64):
     return str(s or "").strip()[:n]
 
 
-# Throttled admin DM alert when something breaks. Off by default — set
-# NOTIFY_ADMIN_ERRORS=1 to receive error DMs again.
+# Admin reports: ALWAYS on by default — good news, warnings and issues alike.
+# Set ADMIN_REPORTS=0 to silence. Same-message throttle: once per 10 min.
 _alert_seen = {}
-NOTIFY_ADMIN_ERRORS = os.getenv("NOTIFY_ADMIN_ERRORS", "0") == "1"
+ADMIN_REPORTS = os.getenv("ADMIN_REPORTS", "1") == "1"
+_REPORT_PREFIX = {"good": "GOOD NEWS", "warning": "WARNING", "issue": "ISSUE", "digest": "DAILY DIGEST"}
 
 
-async def notify_admin(text):
-    if not NOTIFY_ADMIN_ERRORS:
+async def notify_admin(text, level="issue"):
+    if not ADMIN_REPORTS:
         return
     try:
         if not bot or not ALERT_ADMIN_ID:
@@ -385,9 +418,80 @@ async def notify_admin(text):
         if _alert_seen.get(key, 0) > now - 600:   # same alert at most once / 10 min
             return
         _alert_seen[key] = now
-        await asyncio.wait_for(bot.send_message(int(ALERT_ADMIN_ID), ("GiftTrove alert\n\n" + str(text))[:3500]), timeout=10)
+        head = f"GiftTrove report — {_REPORT_PREFIX.get(level, 'ISSUE')}"
+        await asyncio.wait_for(bot.send_message(int(ALERT_ADMIN_ID), (head + "\n\n" + str(text))[:3500]), timeout=10)
     except Exception as e:
         log.info("notify_admin failed: %s", e)
+
+
+_MILESTONES = {5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000}
+
+
+def _maybe_milestone():
+    """If total members just hit a milestone, fire a good-news report."""
+    try:
+        with db() as conn:
+            n = conn.execute("SELECT COUNT(*) c FROM members").fetchone()["c"]
+        if n in _MILESTONES or (n >= 20000 and n % 10000 == 0):
+            asyncio.get_event_loop().create_task(
+                notify_admin(f"Member milestone reached: {n} total members.", level="good")
+            )
+    except Exception as e:
+        log.info("milestone check skipped: %s", e)
+
+
+def _meta_get(key, default=""):
+    try:
+        with db() as conn:
+            r = conn.execute("SELECT val FROM meta WHERE key=?", (key,)).fetchone()
+            return r["val"] if r else default
+    except Exception:
+        return default
+
+
+def _meta_set(key, val):
+    try:
+        with db() as conn:
+            cur = conn.execute("UPDATE meta SET val=? WHERE key=?", (str(val), key))
+            if not cur.rowcount:
+                conn.execute("INSERT INTO meta(key, val) VALUES(?, ?) ON CONFLICT DO NOTHING", (key, str(val)))
+            conn.commit()
+    except Exception as e:
+        log.info("meta_set skipped: %s", e)
+
+
+async def _daily_digest_loop():
+    """Once a day, DM the admin a full status digest (good news, plain facts)."""
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            now = int(time.time())
+            last = int(_meta_get("last_digest", "0") or 0)
+            if last == 0:
+                _meta_set("last_digest", now)   # first boot: start the clock
+                continue
+            if now - last < 86400:
+                continue
+            day = now - 86400
+            with db() as conn:
+                q = lambda s, p=(): conn.execute(s, p).fetchone()["c"]
+                members = q("SELECT COUNT(*) c FROM members")
+                new24 = q("SELECT COUNT(*) c FROM events WHERE kind='new_member' AND ts>?", (day,))
+                opens24 = q("SELECT COUNT(*) c FROM events WHERE kind IN ('open','new_member') AND ts>?", (day,))
+                searches24 = q("SELECT COUNT(*) c FROM events WHERE kind='search' AND ts>?", (day,))
+                shares24 = q("SELECT COUNT(*) c FROM events WHERE kind='share' AND ts>?", (day,))
+                toprow = conn.execute("SELECT gift, count FROM gift_searches ORDER BY count DESC LIMIT 1").fetchone()
+            top_line = f"{toprow['gift']} ({toprow['count']} scouts)" if toprow else "none yet"
+            txt = (
+                f"Last 24h — opens: {opens24}, searches: {searches24}, shares: {shares24}, new members: {new24}.\n"
+                f"Total members: {members}.\n"
+                f"Top scouted gift overall: {top_line}.\n"
+                f"DB: {'Postgres' if USE_PG else 'SQLite'} — MTProto: {'live' if (client and client.is_connected()) else 'down'}."
+            )
+            await notify_admin(txt, level="digest")
+            _meta_set("last_digest", now)
+        except Exception as e:
+            log.info("digest loop skipped: %s", e)
 
 
 # ─── Telethon client lifecycle ────────────────────────────────────────────────
@@ -509,13 +613,29 @@ async def background_telethon_initializer():
     else:
         log.warning("BOT_TOKEN not provided — /start handler skipped.")
 
-    # 2b) Pre-warm the gift cache so the very first visitor sees gifts instantly.
+    # 2b) Pre-warm the gift cache so the very first visitor sees gifts instantly
+    #     (this also downloads the real preview thumbnails into memory).
     if client is not None:
         try:
             await featured()
             log.info("Featured gifts pre-warmed.")
         except Exception as e:
             log.info("featured pre-warm skipped: %s", e)
+        try:
+            asyncio.get_event_loop().create_task(collections())
+        except Exception as e:
+            log.info("collections pre-warm skipped: %s", e)
+
+    # 2c) Reports: deploy-live good news + the daily digest loop.
+    try:
+        asyncio.get_event_loop().create_task(_daily_digest_loop())
+        asyncio.get_event_loop().create_task(notify_admin(
+            f"Backend deployed and live.\nDB: {'Postgres' if USE_PG else 'SQLite'}.\n"
+            f"MTProto session: {'connected' if (client and client.is_connected()) else 'offline'}. Bot: online.",
+            level="good",
+        ))
+    except Exception as e:
+        log.info("report tasks skipped: %s", e)
 
     # 3) Keepalive: ping Telegram every 2 min so the socket never goes stale,
     #    and refresh the featured cache so it's always warm.
@@ -695,6 +815,57 @@ def _stripped_data_uri(doc):
     except Exception:
         pass
     return None
+
+
+# Real (non-stripped) thumbnails for gift stickers + attribute documents.
+# Star-gift stickers are TGS animations whose thumbs are usually vector paths,
+# NOT stripped JPEGs — so the old stripped-only approach yielded no preview at
+# all for most collections/models/symbols. Here we download the real static
+# thumbnail once per document and cache the data URI in memory.
+import base64 as _b64mod
+
+_thumb_cache = {}
+_thumb_sem = asyncio.Semaphore(8)
+
+
+async def _doc_thumb_uri(doc):
+    did = getattr(doc, "id", None)
+    if did is None:
+        return None
+    if did in _thumb_cache:
+        return _thumb_cache[did]
+    raw = None
+    try:
+        thumbs = getattr(doc, "thumbs", None) or []
+        # Prefer the smallest REAL PhotoSize (has w/h, no inline bytes) —
+        # crisp enough for icons without multi-MB payloads.
+        real = [t for t in thumbs if getattr(t, "w", 0) and not getattr(t, "bytes", None)]
+        pick = min(real, key=lambda t: getattr(t, "w", 10**6)) if real else None
+        if client is not None and (pick is not None or thumbs):
+            async with _thumb_sem:
+                try:
+                    raw = await asyncio.wait_for(
+                        client.download_media(doc, file=bytes, thumb=pick if pick is not None else -1),
+                        timeout=20,
+                    )
+                except TypeError:
+                    raw = await asyncio.wait_for(
+                        client.download_media(doc, file=bytes, thumb=-1), timeout=20
+                    )
+    except Exception as e:
+        log.info("thumb download skipped: %s", e)
+    uri = None
+    if raw:
+        head = bytes(raw[:8])
+        mime = ("image/webp" if head[:4] == b"RIFF"
+                else "image/png" if head[:4] == b"\x89PNG"
+                else "image/jpeg")
+        uri = f"data:{mime};base64," + _b64mod.b64encode(raw).decode()
+    if not uri:
+        uri = _stripped_data_uri(doc)   # last-resort low-res fallback
+    if uri and len(_thumb_cache) < 8000:
+        _thumb_cache[did] = uri
+    return uri
 
 
 def _attr_id(a):
@@ -976,20 +1147,27 @@ async def collections():
     try:
         res = await _invoke(lambda: GetStarGifts(hash=0))
         raw = getattr(res, "gifts", []) or []
-        out = []
+        keep = []
         for g in raw:
             title = getattr(g, "title", None)
             # Skip gifts with no real name — those un-named "Gift <id>" entries
             # are non-collectible/parked star gifts and only add noise.
             if not title or not str(title).strip():
                 continue
-            title = str(title).strip()
+            keep.append((str(title).strip(), g))
+        # Real preview images, fetched in parallel (cached after first run).
+        previews = await asyncio.gather(
+            *[_doc_thumb_uri(getattr(g, "sticker", None)) for _, g in keep],
+            return_exceptions=True,
+        )
+        out = []
+        for (title, g), pv in zip(keep, previews):
             out.append({
                 "name": title,
                 "slug": getattr(g, "slug", None) or _slug_from_title(title),
                 "gift_id": str(getattr(g, "id", "") or ""),
                 "supply": getattr(g, "availability_total", None) or getattr(g, "availability_issued", None) or 0,
-                "preview": _stripped_data_uri(getattr(g, "sticker", None)) or "",
+                "preview": (pv if isinstance(pv, str) else None) or "",
             })
         out = [c for c in out if c["gift_id"]]
         cache_set("collections", out, ttl=900)
@@ -1085,6 +1263,7 @@ async def attributes(gift_id: str = Query(...)):
     try:
         res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0, offset="", limit=1))
         models, symbols, backdrops = [], [], []
+        model_docs, symbol_docs = [], []
         id_map = {"model": {}, "symbol": {}, "backdrop": {}}
         for a in getattr(res, "attributes", []) or []:
             cls = type(a).__name__
@@ -1093,11 +1272,13 @@ async def attributes(gift_id: str = Query(...)):
             rar = round(rar / 10, 2) if isinstance(rar, (int, float)) else None
             aid = _attr_id(a)
             if cls == "StarGiftAttributeModel":
-                models.append({"name": name, "rarity": rar, "img": _stripped_data_uri(getattr(a, "document", None))})
+                models.append({"name": name, "rarity": rar, "img": None})
+                model_docs.append(getattr(a, "document", None))
                 if name and aid is not None:
                     id_map["model"][name] = aid
             elif cls == "StarGiftAttributePattern":
-                symbols.append({"name": name, "rarity": rar, "img": _stripped_data_uri(getattr(a, "document", None))})
+                symbols.append({"name": name, "rarity": rar, "img": None})
+                symbol_docs.append(getattr(a, "document", None))
                 if name and aid is not None:
                     id_map["symbol"][name] = aid
             elif cls == "StarGiftAttributeBackdrop":
@@ -1108,6 +1289,17 @@ async def attributes(gift_id: str = Query(...)):
                 })
                 if name and aid is not None:
                     id_map["backdrop"][name] = aid
+        # Real images for models + symbols, fetched in parallel (cached).
+        imgs = await asyncio.gather(
+            *[_doc_thumb_uri(d) for d in model_docs + symbol_docs],
+            return_exceptions=True,
+        )
+        for i, m in enumerate(models):
+            v = imgs[i]
+            m["img"] = v if isinstance(v, str) else None
+        for j, s in enumerate(symbols):
+            v = imgs[len(model_docs) + j]
+            s["img"] = v if isinstance(v, str) else None
         _attr_ids_cache[str(gift_id)] = id_map
         result = {"models": models, "symbols": symbols, "backdrops": backdrops}
         cache_set(key, result, ttl=900)
@@ -1292,6 +1484,8 @@ async def access(uid: str = Query(""), code: str = Query(""), x_init_data: str =
     ok = is_admin or (_clamp(code, 40) == ACCESS_CODE and ACCESS_CODE != "")
     if ok:
         new_member = track_visit(eff_uid)
+        if new_member:
+            _maybe_milestone()
         return {"ok": True, "admin": is_admin, "new_member": new_member}
     return {"ok": False, "admin": False}
 
@@ -1324,10 +1518,16 @@ async def analytics(uid: str = Query(""), code: str = Query(""), range_q: str = 
             out["unique_gifts"] = q("SELECT COUNT(*) c FROM gift_searches")
             out["referrals_total"] = q("SELECT COUNT(*) c FROM referrals")
             out["unique_referrers"] = q("SELECT COUNT(DISTINCT uid) c FROM referrals")
+            out["shares_total"] = q("SELECT COALESCE(SUM(count),0) c FROM gift_shares")
+            out["shares_24h"] = q("SELECT COUNT(*) c FROM events WHERE kind='share' AND ts>?", (day,))
+            out["shares_7d"] = q("SELECT COUNT(*) c FROM events WHERE kind='share' AND ts>?", (week,))
             mt = out["members_total"] or 1
             out["avg_searches_per_member"] = round((out["searches_total"] or 0) / mt, 1)
-            top = conn.execute("SELECT gift, count FROM gift_searches ORDER BY count DESC LIMIT 20").fetchall()
+            # FULL lists (every gift ever scouted / shared, ordered by count).
+            top = conn.execute("SELECT gift, count FROM gift_searches ORDER BY count DESC LIMIT 500").fetchall()
             out["top_searches"] = [{"gift": r["gift"], "count": r["count"]} for r in top]
+            shr = conn.execute("SELECT gift, count FROM gift_shares ORDER BY count DESC LIMIT 500").fetchall()
+            out["top_shares"] = [{"gift": r["gift"], "count": r["count"]} for r in shr]
 
             # ── activity series for the requested range (single query) ──
             cfg = {"7d": (7, 86400), "12w": (12, 7 * 86400), "24m": (24, 30 * 86400)}
@@ -1529,14 +1729,15 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
             "allow_bot_chats": False,
         })
         if resp and resp.get("ok") and (resp.get("result") or {}).get("id"):
+            track_share(name)
             return {"ok": True, "id": resp["result"]["id"]}
         desc = (resp or {}).get("description", "prepare_failed")
         log.error("savePreparedInlineMessage failed: %s", resp)
-        await notify_admin(f"/api/share rejected: {desc}")
+        await notify_admin(f"/api/share rejected: {desc}", level="warning")
         return {"ok": False, "error": desc}
     except Exception as e:
         log.error("share prepare error: %s", e)
-        await notify_admin(f"/api/share error: {type(e).__name__}: {e}")
+        await notify_admin(f"/api/share error: {type(e).__name__}: {e}", level="issue")
         return {"ok": False, "error": "prepare_failed"}
 
 
