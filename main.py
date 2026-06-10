@@ -1243,6 +1243,7 @@ async def featured():
 
 
 _attr_ids_cache = {}   # gift_id -> {"model": {name: AttrId}, "symbol": {...}, "backdrop": {...}}
+_attrs_stale = {}      # gift_id -> last good /api/attributes payload (stale-ok fallback)
 
 
 @app.get("/api/attributes")
@@ -1302,10 +1303,16 @@ async def attributes(gift_id: str = Query(...)):
             s["img"] = v if isinstance(v, str) else None
         _attr_ids_cache[str(gift_id)] = id_map
         result = {"models": models, "symbols": symbols, "backdrops": backdrops}
-        cache_set(key, result, ttl=900)
+        cache_set(key, result, ttl=21600)          # attributes barely change — 6h
+        _attrs_stale[str(gift_id)] = result        # long-lived safety copy
         return result
     except Exception as e:
         log.error("attributes error: %s", e)
+        # Transient MTProto hiccup (flood-wait/timeout): serve the last good
+        # copy instead of an empty list, so the UI never shows just "Any".
+        stale = _attrs_stale.get(str(gift_id))
+        if stale:
+            return stale
         return {**empty, "error": str(e)}
 
 
@@ -1561,6 +1568,13 @@ async def analytics(uid: str = Query(""), code: str = Query(""), range_q: str = 
             out["range"] = rng
             out["range_start"] = time.strftime("%b %d, %Y", time.gmtime(start))
             out["range_end"] = time.strftime("%b %d, %Y", time.gmtime(now))
+            # Range-scoped aggregates (the Activity tab's stat cards follow the
+            # selected range, not a fixed 7d window).
+            out["opens_range"] = q("SELECT COUNT(*) c FROM events WHERE kind IN ('open','new_member') AND ts>=?", (start,))
+            out["searches_range"] = q("SELECT COUNT(*) c FROM events WHERE kind='search' AND ts>=?", (start,))
+            out["new_range"] = q("SELECT COUNT(*) c FROM events WHERE kind='new_member' AND ts>=?", (start,))
+            out["active_range"] = q("SELECT COUNT(*) c FROM members WHERE last_seen>=?", (start,))
+            out["shares_range"] = q("SELECT COUNT(*) c FROM events WHERE kind='share' AND ts>=?", (start,))
     except Exception as e:
         out["error"] = str(e)
         await notify_admin(f"/api/analytics db error: {e}")
@@ -1698,6 +1712,9 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
     if not link.startswith("https://"):
         link = ""
     _mid = " \u00b7 "
+    # Count the share the moment it's initiated — a share is a share whether
+    # Telegram serves the prepared card or the plain sheet.
+    track_share(name)
 
     title = f"{name}{(' #' + num) if num else ''}"
     # No emoji: premium custom emoji do not render in prepared inline messages
@@ -1739,7 +1756,6 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
             "allow_bot_chats": False,
         })
         if resp and resp.get("ok") and (resp.get("result") or {}).get("id"):
-            track_share(name)
             return {"ok": True, "id": resp["result"]["id"]}
         desc = (resp or {}).get("description", "prepare_failed")
         log.error("savePreparedInlineMessage failed: %s", resp)
