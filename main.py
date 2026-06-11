@@ -1819,6 +1819,7 @@ async def userdata_clear(x_init_data: str = Header(default="", alias="X-Init-Dat
         with db() as conn:
             conn.execute("DELETE FROM user_data WHERE uid=?", (str(uid),))
             conn.execute("DELETE FROM referrals WHERE uid=?", (str(uid),))
+            conn.execute("DELETE FROM referrals WHERE referred_by=?", (str(uid),))
             conn.execute("DELETE FROM members WHERE uid_hash=?", (_uid_hash(uid),))
             conn.commit()
         return {"ok": True}
