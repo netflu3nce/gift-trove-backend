@@ -1022,25 +1022,30 @@ def _frag_item(tg_slug, gift_name, num, price, fslug):
 
 
 def _parse_fragment_gifts(html, tg_slug, gift_name, fslug):
-    """Tolerant parser for fragment.com/gifts/<slug> listing pages.
-    Strategy A: table rows with /gift/<fslug>-<num> links + TON price + status.
-    Strategy B: plain-text fallback (#num ... price ... status)."""
+    """Structure-agnostic parser for fragment.com/gifts/<slug> pages.
+    Anchors on every /gift/<fslug>-<num> link and reads the chunk up to the
+    next link — works whether Fragment renders tables or card grids, and
+    tolerates multiple links per card. Captures EVERY buyable listing on
+    the page (the old row-split approach matched far too few)."""
     items, seen = [], set()
-    buyable = ("for sale", "available")
-    rows = _re.split(r"<tr[\s>]", html)
-    for row in rows:
-        m = _re.search(rf"/gift/{_re.escape(fslug)}-(\d+)", row)
-        if not m:
-            continue
+    link_re = _re.compile(rf"/gift/{_re.escape(fslug)}-(\d+)", _re.I)
+    matches = list(link_re.finditer(html))
+    for i, m in enumerate(matches):
         num = m.group(1)
         if num in seen:
             continue
-        low = row.lower()
-        if not any(s in low for s in buyable):
-            continue   # skip Sold / auctions in v1 (no clean buy-now price)
-        pm = _re.search(r"icon-ton[^>]*>\s*([\d][\d,\.]*)", row)
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else min(len(html), start + 1600)
+        win = html[start:end]
+        low = win.lower()
+        # only direct-sale listings in v1 (auctions have no clean buy-now price)
+        if "auction" in low:
+            continue
+        if not ("for sale" in low or "available" in low or "status-avail" in low):
+            continue
+        pm = _re.search(r"icon-ton[^>]*>\s*([\d][\d,\.]*)", win)
         if not pm:
-            pm = _re.search(r">\s*([\d][\d,\.]*)\s*<", row)
+            pm = _re.search(r">\s*([\d][\d,\.]*)\s*<", win)
         if not pm:
             continue
         try:
@@ -1049,18 +1054,6 @@ def _parse_fragment_gifts(html, tg_slug, gift_name, fslug):
             continue
         seen.add(num)
         items.append(_frag_item(tg_slug, gift_name, num, price, fslug))
-    if not items:
-        # Fallback: text-shaped page (defensive; markup may change)
-        for m in _re.finditer(r"#(\d+)[\s\S]{0,160}?([\d][\d,\.]*)\s*(For sale|Available)", html):
-            num = m.group(1)
-            if num in seen:
-                continue
-            try:
-                price = float(m.group(2).replace(",", ""))
-            except Exception:
-                continue
-            seen.add(num)
-            items.append(_frag_item(tg_slug, gift_name, num, price, fslug))
     items.sort(key=lambda x: (x["price"] is None, x["price"]))
     return items
 
@@ -1656,7 +1649,7 @@ async def search(
     # (better no results than wrong ones).
     if slug and not (model or symbol or backdrop) and (not want or "Fragment" in want):
         try:
-            results.extend(await fragment_search(slug, gift, limit=24))
+            results.extend(await fragment_search(slug, gift, limit=40))
         except Exception as e:
             log.info("fragment dispatch skipped: %s", e)
 
@@ -1680,6 +1673,26 @@ async def search(
     results.sort(key=lambda r: (r.get("price") is None, r.get("price") or 0), reverse=rev)
     if rev:
         results.sort(key=lambda r: r.get("price") is None)  # keep None last
+
+    # Mixed feed: when several marketplaces are present, interleave them
+    # round-robin (each market keeps its own price order) so no single source
+    # monopolizes the top of the results.
+    order, by_market = [], {}
+    for r in results:
+        mk = r.get("market") or "Other"
+        if mk not in by_market:
+            by_market[mk] = []
+            order.append(mk)
+        by_market[mk].append(r)
+    if len(order) > 1:
+        mixed, idx = [], 0
+        while len(mixed) < len(results):
+            for mk in order:
+                lst = by_market[mk]
+                if idx < len(lst):
+                    mixed.append(lst[idx])
+            idx += 1
+        results = mixed
 
     return {"results": results, "next_offset": next_offset, "count": len(results)}
 
