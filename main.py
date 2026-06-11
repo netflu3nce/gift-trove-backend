@@ -442,9 +442,12 @@ def _maybe_milestone():
         with db() as conn:
             n = conn.execute("SELECT COUNT(*) c FROM members").fetchone()["c"]
         if n in _MILESTONES or (n >= 20000 and n % 10000 == 0):
-            asyncio.get_event_loop().create_task(
-                notify_admin(f"Member milestone reached: {n} total members.", level="good")
-            )
+            try:
+                asyncio.get_running_loop().create_task(
+                    notify_admin(f"Member milestone reached: {n} total members.", level="good")
+                )
+            except RuntimeError:
+                pass
     except Exception as e:
         log.info("milestone check skipped: %s", e)
 
@@ -631,14 +634,14 @@ async def background_telethon_initializer():
         except Exception as e:
             log.info("featured pre-warm skipped: %s", e)
         try:
-            asyncio.get_event_loop().create_task(collections())
+            asyncio.create_task(collections())
         except Exception as e:
             log.info("collections pre-warm skipped: %s", e)
 
     # 2c) Reports: deploy-live good news + the daily digest loop.
     try:
-        asyncio.get_event_loop().create_task(_daily_digest_loop())
-        asyncio.get_event_loop().create_task(notify_admin(
+        asyncio.create_task(_daily_digest_loop())
+        asyncio.create_task(notify_admin(
             f"Backend deployed and live.\nDB: {'Postgres' if USE_PG else 'SQLite'}.\n"
             f"MTProto session: {'connected' if (client and client.is_connected()) else 'offline'}. Bot: online.",
             level="good",
@@ -997,6 +1000,113 @@ def serialize_unique(g):
     }
 
 
+# ─── Fragment (scraped public listings — Fragment has NO official API) ────────
+_frag_cache = {}          # fslug -> (ts, items)
+_frag_fail_noted = 0.0
+
+
+def _frag_item(tg_slug, gift_name, num, price, fslug):
+    base = cdn_full(tg_slug, num)
+    return {
+        "id": f"frag-{fslug}-{num}",
+        "slug": base,
+        "num": int(num),
+        "name": gift_name or tg_slug,
+        "model": None, "modelRarity": None, "symbol": None,
+        "backdrop": None, "backdropHex": None,
+        "price": price, "currency": "TON",
+        "market": "Fragment",
+        "url": f"https://fragment.com/gift/{fslug}-{num}",
+        "image": cdn_image(base), "animation": cdn_anim(base),
+    }
+
+
+def _parse_fragment_gifts(html, tg_slug, gift_name, fslug):
+    """Tolerant parser for fragment.com/gifts/<slug> listing pages.
+    Strategy A: table rows with /gift/<fslug>-<num> links + TON price + status.
+    Strategy B: plain-text fallback (#num ... price ... status)."""
+    items, seen = [], set()
+    buyable = ("for sale", "available")
+    rows = _re.split(r"<tr[\s>]", html)
+    for row in rows:
+        m = _re.search(rf"/gift/{_re.escape(fslug)}-(\d+)", row)
+        if not m:
+            continue
+        num = m.group(1)
+        if num in seen:
+            continue
+        low = row.lower()
+        if not any(s in low for s in buyable):
+            continue   # skip Sold / auctions in v1 (no clean buy-now price)
+        pm = _re.search(r"icon-ton[^>]*>\s*([\d][\d,\.]*)", row)
+        if not pm:
+            pm = _re.search(r">\s*([\d][\d,\.]*)\s*<", row)
+        if not pm:
+            continue
+        try:
+            price = float(pm.group(1).replace(",", ""))
+        except Exception:
+            continue
+        seen.add(num)
+        items.append(_frag_item(tg_slug, gift_name, num, price, fslug))
+    if not items:
+        # Fallback: text-shaped page (defensive; markup may change)
+        for m in _re.finditer(r"#(\d+)[\s\S]{0,160}?([\d][\d,\.]*)\s*(For sale|Available)", html):
+            num = m.group(1)
+            if num in seen:
+                continue
+            try:
+                price = float(m.group(2).replace(",", ""))
+            except Exception:
+                continue
+            seen.add(num)
+            items.append(_frag_item(tg_slug, gift_name, num, price, fslug))
+    items.sort(key=lambda x: (x["price"] is None, x["price"]))
+    return items
+
+
+async def fragment_search(tg_slug, gift_name, limit=24):
+    """Direct-sale Fragment listings for a collection. Cached 2 min; serves a
+    stale copy on failure; warns the admin at most once an hour if blocked."""
+    global _frag_fail_noted
+    if not (HTTPX_OK and tg_slug):
+        return []
+    fslug = _re.sub(r"[^a-z0-9]", "", str(tg_slug).lower())
+    if not fslug:
+        return []
+    now = time.time()
+    hit = _frag_cache.get(fslug)
+    if hit and now - hit[0] < 120:
+        return hit[1][:limit]
+    url = f"https://fragment.com/gifts/{fslug}?filter=sale&sort=price_asc"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://fragment.com/gifts",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as cli:
+            r = await cli.get(url, headers=headers)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        items = _parse_fragment_gifts(r.text, tg_slug, gift_name, fslug)
+        _frag_cache[fslug] = (now, items)
+        if len(_frag_cache) > 200:
+            _frag_cache.pop(next(iter(_frag_cache)))
+        return items[:limit]
+    except Exception as e:
+        log.info("fragment search skipped: %s", e)
+        if now - _frag_fail_noted > 3600:
+            _frag_fail_noted = now
+            try:
+                await notify_admin(f"Fragment scrape failing: {type(e).__name__}: {e}", level="warning")
+            except Exception:
+                pass
+        stale = _frag_cache.get(fslug)
+        return stale[1][:limit] if stale else []
+
+
 # ─── GetGems (OPTIONAL secondary source) ──────────────────────────────────────
 async def getgems_search(gift_name, limit=12, collection_address=None):
     if not (GETGEMS_API_KEY and HTTPX_OK and gift_name):
@@ -1231,7 +1341,7 @@ async def collections():
     db_copy = _collections_db_get()
     if db_copy:
         cache_set("collections", db_copy, ttl=900)
-        asyncio.get_event_loop().create_task(_refresh_collections_bg())
+        asyncio.create_task(_refresh_collections_bg())
         return {"collections": db_copy, "_served": "durable"}
     # First boot ever (no durable copy yet): build inline, single-flight.
     async with _collections_lock:
@@ -1540,6 +1650,15 @@ async def search(
 
     if gift and (not want or "GetGems" in want):
         results.extend(await getgems_search(gift, limit=12))
+
+    # Fragment: real scraped listings. Attribute filters are Telegram-native
+    # only, so Fragment is skipped when model/symbol/backdrop is selected
+    # (better no results than wrong ones).
+    if slug and not (model or symbol or backdrop) and (not want or "Fragment" in want):
+        try:
+            results.extend(await fragment_search(slug, gift, limit=24))
+        except Exception as e:
+            log.info("fragment dispatch skipped: %s", e)
 
     # Optional price-range filter (applies to numeric prices in the page).
     if min_price or max_price:
