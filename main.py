@@ -1431,6 +1431,39 @@ def _attrs_db_get(gift_id):
     return None, 0
 
 
+def _idmap_to_jsonable(id_map):
+    """Telethon StarGiftAttributeId objects → plain ints for durable storage."""
+    out = {"model": {}, "symbol": {}, "backdrop": {}}
+    for name, obj in (id_map.get("model") or {}).items():
+        v = getattr(obj, "document_id", None)
+        if v is not None:
+            out["model"][name] = int(v)
+    for name, obj in (id_map.get("symbol") or {}).items():
+        v = getattr(obj, "document_id", None)
+        if v is not None:
+            out["symbol"][name] = int(v)
+    for name, obj in (id_map.get("backdrop") or {}).items():
+        v = getattr(obj, "backdrop_id", None)
+        if v is not None:
+            out["backdrop"][name] = int(v)
+    return out
+
+
+def _idmap_from_jsonable(d):
+    """Rebuild the Telethon attribute-id objects from the stored ints."""
+    out = {"model": {}, "symbol": {}, "backdrop": {}}
+    try:
+        for name, v in (d.get("model") or {}).items():
+            out["model"][name] = types.StarGiftAttributeIdModel(document_id=int(v))
+        for name, v in (d.get("symbol") or {}).items():
+            out["symbol"][name] = types.StarGiftAttributeIdPattern(document_id=int(v))
+        for name, v in (d.get("backdrop") or {}).items():
+            out["backdrop"][name] = types.StarGiftAttributeIdBackdrop(backdrop_id=int(v))
+    except Exception as e:
+        log.info("idmap rebuild skipped: %s", e)
+    return out
+
+
 def _attrs_db_set(gift_id, payload):
     try:
         blob = json.dumps(payload)
@@ -1466,7 +1499,7 @@ async def attributes(gift_id: str = Query(...)):
     db_payload, db_ts = _attrs_db_get(gift_id)
     if db_payload and isinstance(db_payload, dict) and db_payload.get("resp") and (time.time() - db_ts) < 7 * 86400:
         if db_payload.get("ids"):
-            _attr_ids_cache[str(gift_id)] = db_payload["ids"]
+            _attr_ids_cache[str(gift_id)] = _idmap_from_jsonable(db_payload["ids"])
         resp = db_payload["resp"]
         cache_set(key, resp, ttl=21600)
         _attrs_stale[str(gift_id)] = resp
@@ -1521,7 +1554,7 @@ async def attributes(gift_id: str = Query(...)):
         result = {"models": models, "symbols": symbols, "backdrops": backdrops}
         cache_set(key, result, ttl=21600)          # attributes barely change — 6h
         _attrs_stale[str(gift_id)] = result        # long-lived safety copy
-        _attrs_db_set(gift_id, {"resp": result, "ids": id_map})   # survives restarts
+        _attrs_db_set(gift_id, {"resp": result, "ids": _idmap_to_jsonable(id_map)})   # survives restarts
         return result
     except Exception as e:
         log.error("attributes error: %s", e)
@@ -1533,7 +1566,7 @@ async def attributes(gift_id: str = Query(...)):
         db_payload, _ = _attrs_db_get(gift_id)
         if db_payload and isinstance(db_payload, dict) and db_payload.get("resp"):
             if db_payload.get("ids"):
-                _attr_ids_cache[str(gift_id)] = db_payload["ids"]
+                _attr_ids_cache[str(gift_id)] = _idmap_from_jsonable(db_payload["ids"])
             return db_payload["resp"]
         return {**empty, "error": str(e)}
 
