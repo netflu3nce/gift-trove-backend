@@ -252,6 +252,15 @@ def init_db():
                    searches TEXT NOT NULL DEFAULT '[]',
                    updated INTEGER NOT NULL DEFAULT 0)"""
         )
+        # Broadcast list: RAW Telegram ids of people who have used the mini app,
+        # so the owner can message everyone. Stored only to deliver broadcasts;
+        # a user's id is removed the moment they clear their data (and re-added if
+        # they open the app again).
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS bcast (
+                   uid TEXT PRIMARY KEY,
+                   ts INTEGER NOT NULL)"""
+        )
         # Indexes — keep the analytics/referral queries fast as data grows.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ref_uid ON referrals(uid);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_members_last ON members(last_seen);")
@@ -374,7 +383,31 @@ ALERT_ADMIN_ID = os.getenv("ALERT_ADMIN_ID", "7608551523")
 _SLUG_RE = _re.compile(r"^[A-Za-z0-9._\-]{1,80}$")
 
 
-def verify_init_data(init_data):
+def _bcast_add(uid):
+    """Remember a mini-app user's real id for broadcasts (opt-in by using it)."""
+    if not uid:
+        return
+    try:
+        with db() as conn:
+            cur = conn.execute("UPDATE bcast SET ts=? WHERE uid=?", (int(time.time()), str(uid)))
+            if not cur.rowcount:
+                conn.execute("INSERT INTO bcast(uid, ts) VALUES(?,?) ON CONFLICT DO NOTHING",
+                             (str(uid), int(time.time())))
+            conn.commit()
+    except Exception as e:
+        log.info("bcast add skipped: %s", e)
+
+
+def _bcast_remove(uid):
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM bcast WHERE uid=?", (str(uid),))
+            conn.commit()
+    except Exception as e:
+        log.info("bcast remove skipped: %s", e)
+
+
+
     """Validate Telegram Mini App initData (HMAC). Returns verified user id (str) or None."""
     if not init_data or not BOT_TOKEN:
         return None
@@ -953,14 +986,16 @@ def _extract_price(g):
             nanos = getattr(a, "nanos", 0) or 0
             val = int(amt) + (int(nanos) / 1e9)
             stars = int(val) if float(val).is_integer() else round(val, 2)
-    # Some sellers list TON-only (can't be bought with Stars) -> price is GRAM.
-    if ton_only and gram is not None:
-        return (gram, "GRAM")
-    if stars is not None:
-        return (stars, "Stars")
+    # `gram` (the StarsTonAmount) is the accurate TON-equivalent Telegram itself
+    # provides, so we prefer it for BOTH display and ranking — that way a Stars
+    # listing and a Fragment listing compare on the same real scale. We only fall
+    # back to raw Stars (sorted via an approximate rate) when no TON value exists.
     if gram is not None:
-        return (gram, "GRAM")
-    return (None, "Stars")
+        return (gram, "GRAM", gram)
+    if stars is not None:
+        gv = (stars / STARS_PER_TON) if STARS_PER_TON else None
+        return (stars, "Stars", gv)
+    return (None, "Stars", None)
 
 
 def _gift_attrs(g):
@@ -985,7 +1020,7 @@ def serialize_unique(g):
     slug = getattr(g, "slug", None) or _slug_from_title(title)
     base = cdn_full(slug, num)
     model, model_rarity, symbol, backdrop, backdrop_hex = _gift_attrs(g)
-    price, currency = _extract_price(g)
+    price, currency, gram_value = _extract_price(g)
     return {
         "id": str(getattr(g, "id", base)),
         "slug": base,
@@ -998,6 +1033,7 @@ def serialize_unique(g):
         "backdropHex": backdrop_hex,
         "price": price,
         "currency": currency,
+        "gram_value": gram_value,
         "market": "Telegram",
         "url": native_url(base),
         "image": cdn_image(base),
@@ -1019,7 +1055,7 @@ def _frag_item(tg_slug, gift_name, num, price, fslug):
         "name": gift_name or tg_slug,
         "model": None, "modelRarity": None, "symbol": None,
         "backdrop": None, "backdropHex": None,
-        "price": price, "currency": "TON",
+        "price": price, "currency": "TON", "gram_value": (float(price) if price is not None else None),
         "market": "Fragment",
         "url": f"https://fragment.com/gift/{fslug}-{num}",
         "image": cdn_image(base), "animation": cdn_anim(base),
@@ -1154,7 +1190,7 @@ async def getgems_search(gift_name, limit=12, collection_address=None):
             "name": n.get("name") or gift_name,
             "model": None, "modelRarity": None, "symbol": None,
             "backdrop": None, "backdropHex": None,
-            "price": price, "currency": "TON", "market": "GetGems",
+            "price": price, "currency": "TON", "gram_value": (float(price) if price is not None else None), "market": "GetGems",
             "url": f"https://getgems.io/nft/{addr}" if addr else None,
             "image": img, "animation": None,
         })
@@ -1705,21 +1741,24 @@ async def search(
             return True
         results = [r for r in results if _in(r.get("price"))]
 
-    # Single global price ranking across ALL marketplaces. Telegram prices are
-    # in Stars and Fragment/GetGems in GRAM(TON), so we sort on a common
-    # GRAM-equivalent (Stars -> GRAM via STARS_PER_TON). No per-market
-    # interleaving: cheapest first for price_asc, highest first for price_desc,
-    # unpriced items always last.
+    # Single global price ranking across ALL marketplaces, on a common GRAM
+    # scale. Each item carries `gram_value`: the real TON-equivalent for
+    # Telegram/Fragment/GetGems, or an approximate Stars->GRAM conversion when
+    # Telegram gave no TON value. Cheapest first for price_asc, highest first for
+    # price_desc; unpriced always last. No per-market interleaving.
     def _gram_value(r):
+        gv = r.get("gram_value")
+        if gv is not None:
+            return gv
         p = r.get("price")
         if p is None:
             return None
         if str(r.get("currency") or "").lower().startswith("star"):
-            return p / STARS_PER_TON if STARS_PER_TON else p
+            return (p / STARS_PER_TON) if STARS_PER_TON else p
         return p
     rev = (sort == "price_desc")
     results.sort(key=lambda r: (_gram_value(r) is None,
-                                -( _gram_value(r) or 0) if rev else (_gram_value(r) or 0)))
+                                -(_gram_value(r) or 0) if rev else (_gram_value(r) or 0)))
 
     return {"results": results, "next_offset": next_offset, "count": len(results)}
 
@@ -1790,6 +1829,7 @@ async def analytics(uid: str = Query(""), code: str = Query(""), range_q: str = 
         with db() as conn:
             q = lambda s, p=(): conn.execute(s, p).fetchone()["c"]
             out["members_total"] = q("SELECT COUNT(*) c FROM members")
+            out["bcast_count"] = q("SELECT COUNT(*) c FROM bcast")
             out["returning_members"] = q("SELECT COUNT(*) c FROM members WHERE visits>1")
             out["active_24h"] = q("SELECT COUNT(*) c FROM members WHERE last_seen>?", (day,))
             out["active_7d"] = q("SELECT COUNT(*) c FROM members WHERE last_seen>?", (week,))
@@ -1896,9 +1936,12 @@ async def add_referral(payload: dict = Body(...), x_init_data: str = Header(defa
 # ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
 @app.get("/api/userdata")
 async def get_userdata(uid: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
-    eff = verify_init_data(x_init_data) or _digits(uid)
+    vid = verify_init_data(x_init_data)
+    eff = vid or _digits(uid)
     if not eff:
         return {"saved": [], "searches": [], "synced": False}
+    if vid:
+        _bcast_add(vid)   # opt into broadcasts simply by using the app (verified id only)
     try:
         with db() as conn:
             row = conn.execute("SELECT saved, searches FROM user_data WHERE uid=?", (eff,)).fetchone()
@@ -1980,6 +2023,7 @@ async def userdata_clear(x_init_data: str = Header(default="", alias="X-Init-Dat
             conn.execute("DELETE FROM referrals WHERE uid=?", (str(uid),))
             conn.execute("DELETE FROM referrals WHERE referred_by=?", (str(uid),))
             conn.execute("DELETE FROM members WHERE uid_hash=?", (_uid_hash(uid),))
+            conn.execute("DELETE FROM bcast WHERE uid=?", (str(uid),))
             conn.commit()
         return {"ok": True}
     except Exception as e:
@@ -2064,6 +2108,67 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
         log.error("share prepare error: %s", e)
         await notify_admin(f"/api/share error: {type(e).__name__}: {e}", level="issue")
         return {"ok": False, "error": "prepare_failed"}
+
+
+# ─── Broadcast: owner DMs every mini-app user (text + optional image). ─────────
+async def _run_broadcast(ids, text, image, owner):
+    """Fan out a broadcast at ~20/sec; drop ids that blocked/deleted the bot."""
+    sent = failed = removed = 0
+    for i, uid in enumerate(ids):
+        try:
+            if image:
+                p = {"chat_id": int(uid), "photo": image}
+                if text:
+                    p["caption"] = text[:1024]
+                resp = await _bot_api("sendPhoto", p)
+            else:
+                resp = await _bot_api("sendMessage", {"chat_id": int(uid), "text": text})
+            if resp and resp.get("ok"):
+                sent += 1
+            else:
+                failed += 1
+                desc = str((resp or {}).get("description", "")).lower()
+                if any(k in desc for k in ("blocked", "deactivated", "chat not found",
+                                           "user is deactivated", "bot was kicked")):
+                    _bcast_remove(uid)
+                    removed += 1
+        except Exception:
+            failed += 1
+        # Telegram tolerates ~30 msg/sec; stay well under it.
+        await asyncio.sleep(1.0 if (i + 1) % 20 == 0 else 0.05)
+    try:
+        await _bot_api("sendMessage", {"chat_id": int(owner),
+            "text": (f"Broadcast finished.\nSent: {sent}\nFailed: {failed}\n"
+                     f"Removed (blocked/deleted): {removed}\nTotal recipients: {len(ids)}")})
+    except Exception:
+        pass
+
+
+@app.post("/api/broadcast")
+async def broadcast(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Owner-only: send a message (with an optional image URL) to every mini-app
+    user who hasn't cleared their data. Runs in the background and DMs the owner
+    a delivery summary when done."""
+    uid = verify_init_data(x_init_data)
+    if not uid or uid not in ADMIN_IDS:
+        return {"ok": False, "error": "unauthorized"}
+    text = _clamp(payload.get("text", ""), 4000)
+    image = _clamp(payload.get("image_url", ""), 512)
+    if image and not image.startswith("https://"):
+        image = ""
+    if not text and not image:
+        return {"ok": False, "error": "empty"}
+    try:
+        with db() as conn:
+            rows = conn.execute("SELECT uid FROM bcast").fetchall()
+        ids = [r["uid"] for r in rows]
+    except Exception as e:
+        log.error("broadcast recipient fetch failed: %s", e)
+        return {"ok": False, "error": "db"}
+    if not ids:
+        return {"ok": True, "recipients": 0, "note": "no recipients yet"}
+    asyncio.create_task(_run_broadcast(ids, text, image, uid))
+    return {"ok": True, "recipients": len(ids)}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
