@@ -986,15 +986,19 @@ def _extract_price(g):
             nanos = getattr(a, "nanos", 0) or 0
             val = int(amt) + (int(nanos) / 1e9)
             stars = int(val) if float(val).is_integer() else round(val, 2)
-    # `gram` (the StarsTonAmount) is the accurate TON-equivalent Telegram itself
-    # provides, so we prefer it for BOTH display and ranking — that way a Stars
-    # listing and a Fragment listing compare on the same real scale. We only fall
-    # back to raw Stars (sorted via an approximate rate) when no TON value exists.
-    if gram is not None:
-        return (gram, "GRAM", gram)
+    # gram_value = accurate cross-market SORT key (prefer Telegram's real
+    # TON-equivalent; fall back to an approximate Stars->GRAM conversion).
+    gram_value = gram if gram is not None else (
+        (stars / STARS_PER_TON) if (stars is not None and STARS_PER_TON) else None)
+    # DISPLAY stays in the gift's NATIVE currency: a gift buyable with Stars is
+    # shown in Stars; a TON/GRAM listing is shown in GRAM. Only the ordering uses
+    # the unified gram_value above.
+    if ton_only and gram is not None:
+        return (gram, "GRAM", gram_value)
     if stars is not None:
-        gv = (stars / STARS_PER_TON) if STARS_PER_TON else None
-        return (stars, "Stars", gv)
+        return (stars, "Stars", gram_value)
+    if gram is not None:
+        return (gram, "GRAM", gram_value)
     return (None, "Stars", None)
 
 
@@ -1198,7 +1202,7 @@ async def getgems_search(gift_name, limit=12, collection_address=None):
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def health():
     resp = {
         "ok": True,
@@ -1808,6 +1812,7 @@ async def access(uid: str = Query(""), code: str = Query(""), x_init_data: str =
     ok = is_admin or (_clamp(code, 40) == ACCESS_CODE and ACCESS_CODE != "")
     if ok:
         new_member = track_visit(eff_uid)
+        _bcast_add(eff_uid)   # everyone who opens the app joins the broadcast list
         if new_member:
             _maybe_milestone()
         return {"ok": True, "admin": is_admin, "new_member": new_member}
@@ -2145,13 +2150,19 @@ async def _run_broadcast(ids, text, image, owner):
 
 
 @app.post("/api/broadcast")
-async def broadcast(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+async def broadcast(payload: dict = Body(...), uid: str = Query(""), code: str = Query(""),
+                    x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Owner-only: send a message (with an optional image URL) to every mini-app
     user who hasn't cleared their data. Runs in the background and DMs the owner
-    a delivery summary when done."""
-    uid = verify_init_data(x_init_data)
-    if not uid or uid not in ADMIN_IDS:
+    a delivery summary when done. Authorized via verified initData OR (admin id +
+    access code), matching how the admin dashboard itself is gated."""
+    verified = verify_init_data(x_init_data)
+    qid = _digits(uid)
+    authorized = (verified and verified in ADMIN_IDS) or (
+        qid in ADMIN_IDS and _clamp(code, 40) == ACCESS_CODE and ACCESS_CODE != "")
+    if not authorized:
         return {"ok": False, "error": "unauthorized"}
+    owner = (verified if (verified and verified in ADMIN_IDS) else qid)
     text = _clamp(payload.get("text", ""), 4000)
     image = _clamp(payload.get("image_url", ""), 512)
     if image and not image.startswith("https://"):
@@ -2167,7 +2178,7 @@ async def broadcast(payload: dict = Body(...), x_init_data: str = Header(default
         return {"ok": False, "error": "db"}
     if not ids:
         return {"ok": True, "recipients": 0, "note": "no recipients yet"}
-    asyncio.create_task(_run_broadcast(ids, text, image, uid))
+    asyncio.create_task(_run_broadcast(ids, text, image, owner))
     return {"ok": True, "recipients": len(ids)}
 
 
