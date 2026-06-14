@@ -52,6 +52,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "100"))      # per page
 SEARCH_MAX = int(os.getenv("SEARCH_MAX", "1000"))         # hard ceiling per query
+# Telegram resale is priced in Stars; Fragment/GetGems in TON (GRAM). To rank a
+# mixed feed by true price we convert Stars -> GRAM with this rate. It moves with
+# the market, so it's tunable via env without a redeploy. Adjust if the ordering
+# looks off (raise it if Stars-priced gifts rank too high).
+STARS_PER_TON = float(os.getenv("STARS_PER_TON", "200"))
 MTPROTO_TIMEOUT = int(os.getenv("MTPROTO_TIMEOUT", "18"))   # seconds per call
 
 # ─── Access gate ──────────────────────────────────────────────────────────────
@@ -1700,32 +1705,21 @@ async def search(
             return True
         results = [r for r in results if _in(r.get("price"))]
 
-    # Sort by price (None last). Telegram already sorts, but GetGems + filters
-    # can interleave, so we enforce it for a consistent UI.
+    # Single global price ranking across ALL marketplaces. Telegram prices are
+    # in Stars and Fragment/GetGems in GRAM(TON), so we sort on a common
+    # GRAM-equivalent (Stars -> GRAM via STARS_PER_TON). No per-market
+    # interleaving: cheapest first for price_asc, highest first for price_desc,
+    # unpriced items always last.
+    def _gram_value(r):
+        p = r.get("price")
+        if p is None:
+            return None
+        if str(r.get("currency") or "").lower().startswith("star"):
+            return p / STARS_PER_TON if STARS_PER_TON else p
+        return p
     rev = (sort == "price_desc")
-    results.sort(key=lambda r: (r.get("price") is None, r.get("price") or 0), reverse=rev)
-    if rev:
-        results.sort(key=lambda r: r.get("price") is None)  # keep None last
-
-    # Mixed feed: when several marketplaces are present, interleave them
-    # round-robin (each market keeps its own price order) so no single source
-    # monopolizes the top of the results.
-    order, by_market = [], {}
-    for r in results:
-        mk = r.get("market") or "Other"
-        if mk not in by_market:
-            by_market[mk] = []
-            order.append(mk)
-        by_market[mk].append(r)
-    if len(order) > 1:
-        mixed, idx = [], 0
-        while len(mixed) < len(results):
-            for mk in order:
-                lst = by_market[mk]
-                if idx < len(lst):
-                    mixed.append(lst[idx])
-            idx += 1
-        results = mixed
+    results.sort(key=lambda r: (_gram_value(r) is None,
+                                -( _gram_value(r) or 0) if rev else (_gram_value(r) or 0)))
 
     return {"results": results, "next_offset": next_offset, "count": len(results)}
 
