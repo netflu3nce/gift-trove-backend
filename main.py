@@ -407,7 +407,7 @@ def _bcast_remove(uid):
         log.info("bcast remove skipped: %s", e)
 
 
-
+def verify_init_data(init_data):
     """Validate Telegram Mini App initData (HMAC). Returns verified user id (str) or None."""
     if not init_data or not BOT_TOKEN:
         return None
