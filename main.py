@@ -94,6 +94,7 @@ WELCOME_IMAGE = os.getenv("WELCOME_IMAGE", "https://i.ibb.co/5Xmf7H6b/Inria-Seri
 # Premium custom-emoji ids (rendered in the bot's own messages via HTML).
 EMOJI_USER = "5974038293120027938"     # 👤  (start, spot 1)
 EMOJI_SEARCH = "5429571366384842791"   # 🔎  (start, spot 2)
+EMOJI_STAR = os.getenv("EMOJI_STAR", "5197390760122556297")   # premium gold star (🎖️ fallback)
 # Marketplace custom-emoji ids (used by the bot; also returned to the app).
 MARKET_EMOJI = {
     "Telegram": ("5875465628285931233", "\u2708\ufe0f"),
@@ -892,14 +893,42 @@ async def _record_payment(action):
             expires = int(time.time()) + SUB_PERIOD
         _sub_set(uid, tier, expires, charge_id)
         log.info("Stars subscription active: uid=%s tier=%s until=%s", uid, tier, expires)
-        label = "Scout+" if tier == "plus" else "Scout Pro"
-        try:
-            await _bot_api("sendMessage", {"chat_id": int(uid),
-                "text": f"Your GiftTrove {label} subscription is now active. Thank you for supporting GiftTrove."})
-        except Exception:
-            pass
+        await _send_sub_confirmation(uid, tier)
     else:
         log.info("payment with unrecognized payload: %r", payload)
+
+
+async def _send_sub_confirmation(uid, tier):
+    """DM the member what they just unlocked, led by a premium gold-star custom
+    emoji (Premium users see the star; others see the fallback). Sent via the bot's
+    MTProto client so the custom emoji renders, with a plain-text fallback."""
+    if bot is None:
+        return
+    if tier == "pro":
+        line = "Scout Pro unlocked. You can now scout with unlimited filters, claim your own custom referral code, and browse with no promoted gifts in your results."
+    else:
+        line = "Scout+ unlocked. You can now apply up to 5 of each filter in your scouts."
+    try:
+        from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityBold
+        def u16(s):
+            return len(s.encode("utf-16-le")) // 2
+        star = "\U0001F396\uFE0F"   # 🎖️ fallback; overlaid by the premium star
+        segs = [("emoji", star, EMOJI_STAR), ("text", " "), ("bold", line)]
+        text, off, ents = "", 0, []
+        for kind, *rest in segs:
+            s = rest[0]; ln = u16(s)
+            if kind == "emoji":
+                ents.append(MessageEntityCustomEmoji(off, ln, int(rest[1])))
+            elif kind == "bold":
+                ents.append(MessageEntityBold(off, ln))
+            text += s; off += ln
+        await bot.send_message(int(uid), text, formatting_entities=ents)
+    except Exception as e:
+        log.warning("sub confirmation (custom emoji) failed, sending plain: %s", e)
+        try:
+            await _bot_api("sendMessage", {"chat_id": int(uid), "text": line})
+        except Exception:
+            pass
 
 
 async def _connect_user_session():
