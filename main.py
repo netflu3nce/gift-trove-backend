@@ -64,6 +64,11 @@ MTPROTO_TIMEOUT = int(os.getenv("MTPROTO_TIMEOUT", "18"))   # seconds per call
 # env vars so only the operator can change them (never hard-coded in the client).
 ADMIN_IDS = {s.strip() for s in os.getenv("ADMIN_IDS", "7608551523,8124847664").split(",") if s.strip()}
 ACCESS_CODE = os.getenv("ACCESS_CODE", "8f70p").strip()
+# Analytics + broadcast are locked tighter than the app: only this account, and a
+# SEPARATE secret code (never shipped in the frontend) that must be entered each
+# session. Set ADMIN_CODE in env; if it's blank the code path is disabled.
+ANALYTICS_ADMIN_ID = os.getenv("ANALYTICS_ADMIN_ID", "8124847664").strip()
+ADMIN_CODE = os.getenv("ADMIN_CODE", "").strip()
 
 # ─── Rate limiting (protects the backend from abuse / accidental hammering) ────
 RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))   # seconds
@@ -129,6 +134,7 @@ def cache_set(key, val, ttl):
 # restart. For durable analytics use a persistent disk or (better) Postgres.
 # See the scaling notes at the bottom of this file.
 import hashlib
+import secrets as _secrets
 
 if USE_PG:
     try:
@@ -261,6 +267,21 @@ def init_db():
                    uid TEXT PRIMARY KEY,
                    ts INTEGER NOT NULL)"""
         )
+        # Users who used "Clear my data" opt OUT of broadcasts permanently — even if
+        # they keep using the app — so the deletion actually sticks.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS bcast_optout (
+                   uid TEXT PRIMARY KEY,
+                   ts INTEGER NOT NULL)"""
+        )
+        # Friendly, memorable referral codes (e.g. 888OG) mapped to a member's id.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS ref_codes (
+                   uid TEXT PRIMARY KEY,
+                   code TEXT NOT NULL UNIQUE,
+                   ts INTEGER NOT NULL)"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_refcode_code ON ref_codes(code);")
         # Indexes — keep the analytics/referral queries fast as data grows.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ref_uid ON referrals(uid);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_members_last ON members(last_seen);")
@@ -384,11 +405,15 @@ _SLUG_RE = _re.compile(r"^[A-Za-z0-9._\-]{1,80}$")
 
 
 def _bcast_add(uid):
-    """Remember a mini-app user's real id for broadcasts (opt-in by using it)."""
+    """Remember a mini-app user's real id for broadcasts. Users who cleared their
+    data (opted out) are never re-added, so the deletion stays permanent."""
     if not uid:
         return
     try:
         with db() as conn:
+            opted = conn.execute("SELECT 1 FROM bcast_optout WHERE uid=?", (str(uid),)).fetchone()
+            if opted:
+                return
             cur = conn.execute("UPDATE bcast SET ts=? WHERE uid=?", (int(time.time()), str(uid)))
             if not cur.rowcount:
                 conn.execute("INSERT INTO bcast(uid, ts) VALUES(?,?) ON CONFLICT DO NOTHING",
@@ -396,6 +421,87 @@ def _bcast_add(uid):
             conn.commit()
     except Exception as e:
         log.info("bcast add skipped: %s", e)
+
+
+def _bcast_optout(uid):
+    """Mark a user as opted out of broadcasts (set when they clear their data)."""
+    if not uid:
+        return
+    try:
+        with db() as conn:
+            conn.execute("INSERT INTO bcast_optout(uid, ts) VALUES(?,?) ON CONFLICT DO NOTHING",
+                         (str(uid), int(time.time())))
+            conn.commit()
+    except Exception as e:
+        log.info("bcast optout skipped: %s", e)
+
+
+# ─── Friendly referral codes ─────────────────────────────────────────────────
+# Short, memorable, collision-free codes (e.g. 888OG) using an unambiguous
+# alphabet — no 0/O/1/I/L so nobody mistypes a shared link. Length grows
+# automatically as the member base grows.
+_REF_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
+def _gen_ref_code(n):
+    return "".join(_secrets.choice(_REF_ALPHABET) for _ in range(n))
+
+def get_ref_code(uid):
+    """Return this member's referral code, creating a unique one on first use."""
+    if not uid:
+        return None
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT code FROM ref_codes WHERE uid=?", (str(uid),)).fetchone()
+            if row:
+                return row["code"]
+            # length scales with how many codes already exist (keeps them short early on)
+            total = conn.execute("SELECT COUNT(*) c FROM ref_codes").fetchone()["c"]
+            length = 5 if total < 500_000 else (6 if total < 15_000_000 else 7)
+            for _ in range(12):
+                code = _gen_ref_code(length)
+                try:
+                    conn.execute("INSERT INTO ref_codes(uid, code, ts) VALUES(?,?,?)",
+                                 (str(uid), code, int(time.time())))
+                    conn.commit()
+                    return code
+                except Exception:
+                    continue  # rare collision — try another
+            # extreme fallback: widen by one char
+            code = _gen_ref_code(length + 1)
+            conn.execute("INSERT INTO ref_codes(uid, code, ts) VALUES(?,?,?)",
+                         (str(uid), code, int(time.time())))
+            conn.commit()
+            return code
+    except Exception as e:
+        log.info("ref code error: %s", e)
+        return None
+
+def resolve_ref(token):
+    """Resolve a referral token to a referrer uid. Accepts a friendly code (e.g.
+    888OG), a legacy base36-of-uid link (the old frontend format, lowercase), or a
+    raw numeric uid — so every link ever shared still works."""
+    if not token:
+        return None
+    token = str(token).strip()
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT uid FROM ref_codes WHERE code=?", (token.upper(),)).fetchone()
+            if row:
+                return row["uid"]
+    except Exception:
+        pass
+    # legacy base36-of-uid links (old frontend) — lowercase alphanumeric, not all digits
+    low = token.lower()
+    if low and not token.isdigit() and all(c in "0123456789abcdefghijklmnopqrstuvwxyz" for c in low):
+        try:
+            n = int(low, 36)
+            if 10_000 < n < 10**13:   # plausible Telegram user-id range
+                return str(n)
+        except Exception:
+            pass
+    # raw numeric uid
+    digits = _digits(token)
+    return digits or None
 
 
 def _bcast_remove(uid):
@@ -408,28 +514,49 @@ def _bcast_remove(uid):
 
 
 def verify_init_data(init_data):
-    """Validate Telegram Mini App initData (HMAC). Returns verified user id (str) or None."""
-    if not init_data or not BOT_TOKEN:
+    """Validate Telegram Mini App initData (HMAC). Returns verified user id (str) or None.
+
+    Telegram added a `signature` field to initData (for third-party Ed25519
+    validation). Client versions disagree on whether `signature` belongs in the
+    HMAC data-check-string, and stripping it the wrong way silently breaks every
+    verified feature. So we accept the hash if EITHER variant matches — signature
+    excluded (the documented norm) OR included — which keeps verification working
+    across all current Telegram clients. Failures log a one-line reason so the
+    cause is visible in the server logs."""
+    if not init_data:
+        log.info("initData verify: empty payload (app likely opened outside Telegram)")
+        return None
+    if not BOT_TOKEN:
+        log.warning("initData verify: BOT_TOKEN not set")
         return None
     try:
         pairs = dict(parse_qsl(init_data, keep_blank_values=True))
         recv_hash = pairs.pop("hash", None)
-        pairs.pop("signature", None)
         if not recv_hash:
+            log.info("initData verify: no hash field")
             return None
-        dcs = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
+        had_sig = "signature" in pairs
         secret = _hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calc = _hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
-        if not _hmac.compare_digest(calc, recv_hash):
+        def _calc(d):
+            dcs = "\n".join(f"{k}={d[k]}" for k in sorted(d))
+            return _hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+        without_sig = {k: v for k, v in pairs.items() if k != "signature"}
+        ok = _hmac.compare_digest(_calc(without_sig), recv_hash)
+        if not ok and had_sig:
+            ok = _hmac.compare_digest(_calc(pairs), recv_hash)
+        if not ok:
+            log.info("initData verify: HASH MISMATCH (signature_present=%s) — check BOT_TOKEN matches the bot whose Mini App was opened", had_sig)
             return None
         try:
             if int(pairs.get("auth_date", "0")) < int(time.time()) - 86400:
-                return None  # stale (older than 24h)
+                log.info("initData verify: stale auth_date (older than 24h)")
+                return None
         except Exception:
             pass
         uid = (json.loads(pairs.get("user", "{}")) or {}).get("id")
         return str(uid) if uid else None
-    except Exception:
+    except Exception as e:
+        log.info("initData verify: exception %s", e)
         return None
 
 
@@ -1643,7 +1770,7 @@ async def search(
     model = _clamp(model, 80)
     symbol = _clamp(symbol, 80)
     backdrop = _clamp(backdrop, 80)
-    sort = "price_desc" if sort == "price_desc" else "price_asc"
+    sort = sort if sort in ("price_asc", "price_desc") else "default"
     offset = _clamp(offset, 256)
     try:
         min_price = max(0.0, float(min_price or 0))
@@ -1760,9 +1887,12 @@ async def search(
         if str(r.get("currency") or "").lower().startswith("star"):
             return (p / STARS_PER_TON) if STARS_PER_TON else p
         return p
-    rev = (sort == "price_desc")
-    results.sort(key=lambda r: (_gram_value(r) is None,
-                                -(_gram_value(r) or 0) if rev else (_gram_value(r) or 0)))
+    # General is the default: keep the natural order the marketplaces return, and
+    # only rank by price when the user explicitly taps Lowest or Highest.
+    if sort in ("price_asc", "price_desc"):
+        rev = (sort == "price_desc")
+        results.sort(key=lambda r: (_gram_value(r) is None,
+                                    -(_gram_value(r) or 0) if rev else (_gram_value(r) or 0)))
 
     return {"results": results, "next_offset": next_offset, "count": len(results)}
 
@@ -1822,9 +1952,13 @@ async def access(uid: str = Query(""), code: str = Query(""), x_init_data: str =
 @app.get("/api/analytics")
 async def analytics(uid: str = Query(""), code: str = Query(""), range_q: str = Query("7d", alias="range"),
                     x_init_data: str = Header(default="", alias="X-Init-Data")):
-    """Admin-only product analytics. No personal data is stored or returned."""
+    """Admin-only product analytics. No personal data is stored or returned.
+    Locked to the analytics admin + a separate secret ADMIN_CODE (never shipped in
+    the frontend). The general access code can NOT open analytics."""
     verified = verify_init_data(x_init_data)
-    if not ((verified and verified in ADMIN_IDS) or _clamp(code, 40) == ACCESS_CODE):
+    code_ok = bool(ADMIN_CODE) and _clamp(code, 60) == ADMIN_CODE
+    id_ok = (verified is None) or (verified == ANALYTICS_ADMIN_ID)
+    if not (code_ok and id_ok):
         return {"error": "forbidden"}
     rng = range_q if range_q in ("7d", "12w", "24m", "all") else "7d"
     now = int(time.time())
@@ -1922,7 +2056,9 @@ async def add_referral(payload: dict = Body(...), x_init_data: str = Header(defa
     # The new user ("by") must be a verified identity where possible — you can
     # only attribute *yourself* as referred, which blocks fake-referral abuse.
     by = verify_init_data(x_init_data) or _digits(payload.get("by", ""))
-    uid = _digits(payload.get("uid", ""))   # the referrer
+    # The referrer arrives as a friendly code (e.g. 888OG) or a legacy raw-uid
+    # link; resolve either to the referrer's real id.
+    uid = resolve_ref(payload.get("uid", ""))
     if not uid or not by or uid == by:
         return {"ok": False}
     try:
@@ -1936,6 +2072,17 @@ async def add_referral(payload: dict = Body(...), x_init_data: str = Header(defa
     except Exception as e:
         log.error("referral insert error: %s", e)
         return {"ok": False}
+
+
+@app.get("/api/refcode")
+async def refcode(uid: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Return the caller's friendly referral code + ready-to-share link."""
+    eff = verify_init_data(x_init_data) or _digits(uid)
+    if not eff:
+        return {"code": None}
+    code = get_ref_code(eff)
+    link = f"{MINIAPP_URL}?startapp={code}" if code else None
+    return {"code": code, "link": link}
 
 
 # ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
@@ -2029,6 +2176,9 @@ async def userdata_clear(x_init_data: str = Header(default="", alias="X-Init-Dat
             conn.execute("DELETE FROM referrals WHERE referred_by=?", (str(uid),))
             conn.execute("DELETE FROM members WHERE uid_hash=?", (_uid_hash(uid),))
             conn.execute("DELETE FROM bcast WHERE uid=?", (str(uid),))
+            conn.execute("DELETE FROM ref_codes WHERE uid=?", (str(uid),))
+            conn.execute("INSERT INTO bcast_optout(uid, ts) VALUES(?,?) ON CONFLICT DO NOTHING",
+                         (str(uid), int(time.time())))
             conn.commit()
         return {"ok": True}
     except Exception as e:
@@ -2153,16 +2303,15 @@ async def _run_broadcast(ids, text, image, owner):
 async def broadcast(payload: dict = Body(...), uid: str = Query(""), code: str = Query(""),
                     x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Owner-only: send a message (with an optional image URL) to every mini-app
-    user who hasn't cleared their data. Runs in the background and DMs the owner
-    a delivery summary when done. Authorized via verified initData OR (admin id +
-    access code), matching how the admin dashboard itself is gated."""
+    user who hasn't cleared their data. Runs in the background and DMs the admin
+    a delivery summary when done. Locked to the analytics admin + the secret
+    ADMIN_CODE (the general access code can NOT broadcast)."""
     verified = verify_init_data(x_init_data)
-    qid = _digits(uid)
-    authorized = (verified and verified in ADMIN_IDS) or (
-        qid in ADMIN_IDS and _clamp(code, 40) == ACCESS_CODE and ACCESS_CODE != "")
-    if not authorized:
+    code_ok = bool(ADMIN_CODE) and _clamp(code, 60) == ADMIN_CODE
+    id_ok = (verified is None) or (verified == ANALYTICS_ADMIN_ID)
+    if not (code_ok and id_ok):
         return {"ok": False, "error": "unauthorized"}
-    owner = (verified if (verified and verified in ADMIN_IDS) else qid)
+    owner = ANALYTICS_ADMIN_ID
     text = _clamp(payload.get("text", ""), 4000)
     image = _clamp(payload.get("image_url", ""), 512)
     if image and not image.startswith("https://"):
