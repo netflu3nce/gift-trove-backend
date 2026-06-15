@@ -566,6 +566,20 @@ def _sub_set(uid, tier, expires_at, charge_id=""):
     except Exception as e:
         log.error("sub_set failed: %s", e)
 
+def _sub_row(uid):
+    """Raw current subs row as (tier, charge_id), ignoring expiry — used to grab the
+    old charge_id before overwriting on a tier change."""
+    if not uid:
+        return None
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT tier, charge_id FROM subs WHERE uid=?", (str(uid),)).fetchone()
+        if row:
+            return (row["tier"], row["charge_id"])
+    except Exception:
+        pass
+    return None
+
 # A vanity code must look like a code, not impersonate a number that resolve_ref
 # would read as a raw uid, so we require at least one letter.
 _VANITY_RE = _re.compile(r"^[A-Z0-9]{3,12}$")
@@ -852,8 +866,30 @@ async def _record_payment(action):
         pass
     if kind == "sub" and len(parts) >= 3:
         tier, uid = parts[1], parts[2]
+        # If they're switching tiers (e.g. Scout+ -> Scout Pro), cancel the OLD
+        # subscription so Telegram doesn't keep charging for both. We stored the
+        # old charge_id; botCancelStarsSubscription stops its auto-renewal.
+        try:
+            prev = _sub_row(uid)
+            if prev and prev[0] != tier and prev[1] and bot is not None:
+                from telethon.tl import functions as _fn
+                try:
+                    peer = await bot.get_input_entity(int(uid))
+                    await bot(_fn.payments.BotCancelStarsSubscriptionRequest(
+                        user_id=peer, charge_id=prev[1]))
+                    log.info("cancelled old %s subscription for %s on tier change", prev[0], uid)
+                except Exception as e:
+                    log.warning("old-sub auto-cancel failed (uid=%s): %s", uid, e)
+        except Exception:
+            pass
         until = getattr(action, "subscription_until_date", None)
-        expires = int(until) if until else (int(time.time()) + SUB_PERIOD)
+        # Telethon returns this as a datetime; the Bot API would give a unix int.
+        if hasattr(until, "timestamp"):
+            expires = int(until.timestamp())
+        elif isinstance(until, (int, float)) and until:
+            expires = int(until)
+        else:
+            expires = int(time.time()) + SUB_PERIOD
         _sub_set(uid, tier, expires, charge_id)
         log.info("Stars subscription active: uid=%s tier=%s until=%s", uid, tier, expires)
         label = "Scout+" if tier == "plus" else "Scout Pro"
@@ -2290,17 +2326,34 @@ async def create_invoice(payload: dict = Body(...), x_init_data: str = Header(de
 
 @app.post("/api/vanity")
 async def vanity(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
-    """Claim a custom referral code (premium only)."""
+    """Claim a custom referral code (Scout Pro only)."""
     uid = verify_init_data(x_init_data)
     if not uid:
         return {"ok": False, "error": "auth"}
-    if get_tier(uid) == "free":
-        return {"ok": False, "error": "premium"}
+    if get_tier(uid) != "pro":
+        return {"ok": False, "error": "pro"}
     ok, res = set_vanity(uid, payload.get("code"))
     if ok:
         link = f"{MINIAPP_URL}?startapp={res}"
         return {"ok": True, "code": res, "link": link}
     return {"ok": False, "error": res}
+
+@app.post("/api/consent")
+async def consent(x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Called when a member accepts the Terms. Opts them into broadcasts and lifts
+    any prior opt-out from a previous data clear, so re-accepting re-subscribes them
+    (their old searches/saved/referrals stay gone — this only affects messaging)."""
+    uid = verify_init_data(x_init_data)
+    if not uid:
+        return {"ok": False}
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM bcast_optout WHERE uid=?", (str(uid),))
+            conn.commit()
+    except Exception as e:
+        log.info("consent optout-clear skipped: %s", e)
+    _bcast_add(uid)
+    return {"ok": True}
 
 
 # ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
