@@ -59,6 +59,16 @@ SEARCH_MAX = int(os.getenv("SEARCH_MAX", "1000"))         # hard ceiling per que
 STARS_PER_TON = float(os.getenv("STARS_PER_TON", "200"))
 MTPROTO_TIMEOUT = int(os.getenv("MTPROTO_TIMEOUT", "18"))   # seconds per call
 
+# ─── Premium (Telegram Stars subscriptions) ─────────────────────────────────────
+# Monthly price (in Stars) per tier, and how many of each attribute filter
+# (model / symbol / backdrop) a tier may apply at once. Enforced SERVER-SIDE so a
+# modified client can't bypass it. Telegram Stars subscriptions currently allow
+# only a 30-day period (2592000s).
+STARS_PLUS = int(os.getenv("STARS_PLUS", "100"))   # Scout+  / month
+STARS_PRO  = int(os.getenv("STARS_PRO", "300"))    # Scout Pro / month
+SUB_PERIOD = 2592000                                # 30 days, the only allowed period
+TIER_CAPS  = {"free": 1, "plus": 5, "pro": 999}     # max selections per filter type
+
 # ─── Access gate ──────────────────────────────────────────────────────────────
 # Admins bypass automatically; everyone else needs the access code. BOTH live in
 # env vars so only the operator can change them (never hard-coded in the client).
@@ -282,6 +292,17 @@ def init_db():
                    ts INTEGER NOT NULL)"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_refcode_code ON ref_codes(code);")
+        # Active Stars subscriptions. tier in (plus,pro); expires_at is the unix time
+        # the current paid period ends — lapses to free automatically when passed.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS subs (
+                   uid TEXT PRIMARY KEY,
+                   tier TEXT NOT NULL,
+                   expires_at INTEGER NOT NULL,
+                   charge_id TEXT,
+                   ts INTEGER NOT NULL)"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_exp ON subs(expires_at);")
         # Indexes — keep the analytics/referral queries fast as data grows.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ref_uid ON referrals(uid);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_members_last ON members(last_seen);")
@@ -502,6 +523,71 @@ def resolve_ref(token):
     # raw numeric uid
     digits = _digits(token)
     return digits or None
+
+
+# ─── Premium tiers ───────────────────────────────────────────────────────────
+def get_tier(uid):
+    """Active tier for a member: 'free' | 'plus' | 'pro'. Expired subs are free."""
+    if not uid:
+        return "free"
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT tier, expires_at FROM subs WHERE uid=?", (str(uid),)).fetchone()
+        if row and int(row["expires_at"]) > int(time.time()) and row["tier"] in ("plus", "pro"):
+            return row["tier"]
+    except Exception as e:
+        log.info("get_tier error: %s", e)
+    return "free"
+
+def sub_info(uid):
+    """(tier, expires_at) for a member; expires_at is 0 when none/expired."""
+    if not uid:
+        return "free", 0
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT tier, expires_at FROM subs WHERE uid=?", (str(uid),)).fetchone()
+        if row and int(row["expires_at"]) > int(time.time()) and row["tier"] in ("plus", "pro"):
+            return row["tier"], int(row["expires_at"])
+    except Exception:
+        pass
+    return "free", 0
+
+def _sub_set(uid, tier, expires_at, charge_id=""):
+    """Record/renew a subscription (upsert via delete+insert to avoid ON CONFLICT
+    column ambiguity across SQLite/Postgres)."""
+    if not uid or tier not in ("plus", "pro"):
+        return
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM subs WHERE uid=?", (str(uid),))
+            conn.execute("INSERT INTO subs(uid, tier, expires_at, charge_id, ts) VALUES(?,?,?,?,?)",
+                         (str(uid), tier, int(expires_at), charge_id or "", int(time.time())))
+            conn.commit()
+    except Exception as e:
+        log.error("sub_set failed: %s", e)
+
+# A vanity code must look like a code, not impersonate a number that resolve_ref
+# would read as a raw uid, so we require at least one letter.
+_VANITY_RE = _re.compile(r"^[A-Z0-9]{3,12}$")
+
+def set_vanity(uid, code):
+    """Premium perk: claim a custom referral code. Returns (ok, code_or_errorkey)."""
+    code = (code or "").strip().upper()
+    if not _VANITY_RE.match(code) or not any(c.isalpha() for c in code):
+        return False, "format"
+    try:
+        with db() as conn:
+            taken = conn.execute("SELECT uid FROM ref_codes WHERE code=?", (code,)).fetchone()
+            if taken and str(taken["uid"]) != str(uid):
+                return False, "taken"
+            conn.execute("DELETE FROM ref_codes WHERE uid=?", (str(uid),))
+            conn.execute("INSERT INTO ref_codes(uid, code, ts) VALUES(?,?,?)",
+                         (str(uid), code, int(time.time())))
+            conn.commit()
+        return True, code
+    except Exception as e:
+        log.error("set_vanity failed: %s", e)
+        return False, "error"
 
 
 def _bcast_remove(uid):
@@ -725,6 +811,59 @@ async def _register_bot_handlers():
                     await event.respond(WELCOME_PLAIN)
                 except Exception:
                     pass
+
+    # ── Stars payments ──────────────────────────────────────────────────────
+    # Invoices are created via the Bot API (createInvoiceLink), but the resulting
+    # updates flow to this MTProto bot. We must approve the pre-checkout within
+    # ~10s, then the completed payment arrives as a service message.
+    from telethon.tl import functions as _fn, types as _tl
+
+    @bot.on(events.Raw)
+    async def _on_update(update):
+        if isinstance(update, _tl.UpdateBotPrecheckoutQuery):
+            try:
+                await bot(_fn.messages.SetBotPrecheckoutResultsRequest(
+                    query_id=update.query_id, success=True))
+            except Exception as e:
+                log.warning("pre-checkout approve failed: %s", e)
+            return
+        msg = getattr(update, "message", None)
+        action = getattr(msg, "action", None) if msg is not None else None
+        if isinstance(action, _tl.MessageActionPaymentSentMe):
+            try:
+                await _record_payment(action)
+            except Exception as e:
+                log.error("payment record failed: %s", e)
+
+
+async def _record_payment(action):
+    """A Stars payment completed. Parse our own payload and grant the perk.
+    Recurring renewals arrive here too (Telegram auto-charges), so we simply
+    re-stamp the new expiry each time."""
+    payload = action.payload
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", "ignore")
+    parts = (payload or "").split(":")
+    kind = parts[0] if parts else ""
+    charge_id = ""
+    try:
+        charge_id = action.charge.provider_charge_id or action.charge.id
+    except Exception:
+        pass
+    if kind == "sub" and len(parts) >= 3:
+        tier, uid = parts[1], parts[2]
+        until = getattr(action, "subscription_until_date", None)
+        expires = int(until) if until else (int(time.time()) + SUB_PERIOD)
+        _sub_set(uid, tier, expires, charge_id)
+        log.info("Stars subscription active: uid=%s tier=%s until=%s", uid, tier, expires)
+        label = "Scout+" if tier == "plus" else "Scout Pro"
+        try:
+            await _bot_api("sendMessage", {"chat_id": int(uid),
+                "text": f"Your GiftTrove {label} subscription is now active. Thank you for supporting GiftTrove."})
+        except Exception:
+            pass
+    else:
+        log.info("payment with unrecognized payload: %r", payload)
 
 
 async def _connect_user_session():
@@ -1759,6 +1898,7 @@ async def search(
     limit: int = Query(SEARCH_LIMIT),
     min_price: float = Query(0),
     max_price: float = Query(0),
+    x_init_data: str = Header(default="", alias="X-Init-Data"),
 ):
     if not rate_ok(uid):
         return {"results": [], "rate_limited": True}
@@ -1767,9 +1907,6 @@ async def search(
     gift_id = _digits(gift_id)
     slug = _safe_slug(slug)
     num = _digits(num, 12)
-    model = _clamp(model, 80)
-    symbol = _clamp(symbol, 80)
-    backdrop = _clamp(backdrop, 80)
     sort = sort if sort in ("price_asc", "price_desc") else "default"
     offset = _clamp(offset, 256)
     try:
@@ -1780,6 +1917,30 @@ async def search(
     if gift:
         track_search(gift)
 
+    # Premium tier governs how many of each attribute filter (model/symbol/backdrop)
+    # may apply at once: free 1, plus 5, pro unlimited. Identity comes from signed
+    # initData so a modified client can't raise its own caps; the spoofable query
+    # `uid` is used only for rate-limiting and tracking.
+    vuid = verify_init_data(x_init_data)
+    cap = TIER_CAPS.get(get_tier(vuid), 1)
+    def _csv_attr(s):
+        out = []
+        for part in (s or "").split(","):
+            p = _clamp(part.strip(), 80)
+            if p and p.lower() != "any" and p not in out:
+                out.append(p)
+            if len(out) >= cap:
+                break
+        return out
+    models = _csv_attr(model)
+    symbols = _csv_attr(symbol)
+    backdrops = _csv_attr(backdrop)
+    any_attr = bool(models or symbols or backdrops)
+    # lower-cased sets for client-side membership (OR within a type, AND across types)
+    sel = {"model": {n.lower() for n in models},
+           "symbol": {n.lower() for n in symbols},
+           "backdrop": {n.lower() for n in backdrops}}
+
     want = set([m.strip() for m in markets.split(",") if m.strip()]) if markets else set()
     results = []
     next_offset = ""
@@ -1789,20 +1950,27 @@ async def search(
     # Resolve selected model/symbol/backdrop NAMES to attribute IDs so Telegram
     # filters server-side (otherwise matches on deeper pages get missed -> the
     # false "no listings" bug). Ensure the id map for this gift is populated.
-    if gift_id and (model or symbol or backdrop) and str(gift_id) not in _attr_ids_cache:
+    if gift_id and any_attr and str(gift_id) not in _attr_ids_cache:
         try:
             await attributes(gift_id=str(gift_id))
         except Exception:
             pass
     ids = _attr_ids_cache.get(str(gift_id), {})
     attr_filter = []
-    srv_model = srv_symbol = srv_backdrop = False
-    if model and ids.get("model", {}).get(model) is not None:
-        attr_filter.append(ids["model"][model]); srv_model = True
-    if symbol and ids.get("symbol", {}).get(symbol) is not None:
-        attr_filter.append(ids["symbol"][symbol]); srv_symbol = True
-    if backdrop and ids.get("backdrop", {}).get(backdrop) is not None:
-        attr_filter.append(ids["backdrop"][backdrop]); srv_backdrop = True
+    for typ, names in (("model", models), ("symbol", symbols), ("backdrop", backdrops)):
+        tmap = ids.get(typ, {})
+        for nm in names:
+            aid = tmap.get(nm)
+            if aid is not None:
+                attr_filter.append(aid)
+    # Client-side guarantee of the multi-select semantics, independent of how
+    # Telegram combines the id list (so results are always exactly right).
+    def _attr_match(item):
+        for typ in ("model", "symbol", "backdrop"):
+            names = sel[typ]
+            if names and (item.get(typ) or "").lower() not in names:
+                return False
+        return True
 
     if client is not None and GetResale and gift_id and (not want or "Telegram" in want):
         try:
@@ -1826,13 +1994,10 @@ async def search(
                     # Gift number is a SUBSTRING match: "31" -> #31, #312, #5231…
                     if num and num not in str(item.get("num", "")):
                         continue
-                    # Fallback client-side filter only for attributes Telegram
-                    # didn't already filter for us (e.g. id couldn't be resolved).
-                    if model and not srv_model and (item.get("model") or "").lower() != model.lower():
-                        continue
-                    if symbol and not srv_symbol and (item.get("symbol") or "").lower() != symbol.lower():
-                        continue
-                    if backdrop and not srv_backdrop and (item.get("backdrop") or "").lower() != backdrop.lower():
+                    # Multi-select attribute filter (OR within a type, AND across
+                    # types) — enforced here so it's exact regardless of Telegram's
+                    # own attribute-id combination semantics.
+                    if not _attr_match(item):
                         continue
                     results.append(item)
                 fetched += len(chunk)
@@ -1852,7 +2017,7 @@ async def search(
     # Fragment: real scraped listings. Attribute filters are Telegram-native
     # only, so Fragment is skipped when model/symbol/backdrop is selected
     # (better no results than wrong ones).
-    if slug and not (model or symbol or backdrop) and (not want or "Fragment" in want):
+    if slug and not any_attr and (not want or "Fragment" in want):
         try:
             results.extend(await fragment_search(slug, gift, limit=40))
         except Exception as e:
@@ -2083,6 +2248,59 @@ async def refcode(uid: str = Query(""), x_init_data: str = Header(default="", al
     code = get_ref_code(eff)
     link = f"{MINIAPP_URL}?startapp={code}" if code else None
     return {"code": code, "link": link}
+
+
+# ─── Premium: Stars subscriptions + vanity codes ─────────────────────────────
+@app.get("/api/subscription")
+async def subscription(x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """The caller's current tier + when it expires + the per-tier filter caps."""
+    uid = verify_init_data(x_init_data)
+    tier, exp = sub_info(uid)
+    return {"tier": tier, "expires_at": exp, "caps": TIER_CAPS,
+            "prices": {"plus": STARS_PLUS, "pro": STARS_PRO}}
+
+@app.post("/api/create-invoice")
+async def create_invoice(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Create a Telegram Stars subscription invoice link for a tier. Identity is
+    taken from signed initData and baked into the payment payload, so a payment can
+    only ever upgrade the account that actually paid."""
+    uid = verify_init_data(x_init_data)
+    if not uid:
+        return {"ok": False, "error": "auth"}
+    tier = (payload.get("tier") or "").strip()
+    if tier not in ("plus", "pro"):
+        return {"ok": False, "error": "tier"}
+    price = STARS_PLUS if tier == "plus" else STARS_PRO
+    title = "GiftTrove Scout+" if tier == "plus" else "GiftTrove Scout Pro"
+    desc = ("Up to 5 of each filter, a custom referral code, and new perks as they land."
+            if tier == "plus" else
+            "Unlimited filters, a custom referral code, and priority on new perks.")
+    resp = await _bot_api("createInvoiceLink", {
+        "title": title,
+        "description": desc,
+        "payload": f"sub:{tier}:{uid}",
+        "currency": "XTR",
+        "prices": [{"label": f"{title} · 1 month", "amount": price}],
+        "subscription_period": SUB_PERIOD,
+    })
+    if resp and resp.get("ok") and resp.get("result"):
+        return {"ok": True, "link": resp["result"]}
+    log.error("createInvoiceLink failed: %s", resp)
+    return {"ok": False, "error": "invoice"}
+
+@app.post("/api/vanity")
+async def vanity(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Claim a custom referral code (premium only)."""
+    uid = verify_init_data(x_init_data)
+    if not uid:
+        return {"ok": False, "error": "auth"}
+    if get_tier(uid) == "free":
+        return {"ok": False, "error": "premium"}
+    ok, res = set_vanity(uid, payload.get("code"))
+    if ok:
+        link = f"{MINIAPP_URL}?startapp={res}"
+        return {"ok": True, "code": res, "link": link}
+    return {"ok": False, "error": res}
 
 
 # ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
@@ -2355,3 +2573,4 @@ async def broadcast(payload: dict = Body(...), uid: str = Query(""), code: str =
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+p
