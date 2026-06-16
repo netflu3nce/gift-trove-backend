@@ -69,6 +69,13 @@ STARS_PRO  = int(os.getenv("STARS_PRO", "300"))    # Scout Pro / month
 SUB_PERIOD = 2592000                                # 30 days, the only allowed period
 TIER_CAPS  = {"free": 1, "plus": 5, "pro": 999}     # max selections per filter type
 
+# ─── Promoted gifts (one-time Stars, all tiers) ─────────────────────────────────
+PROMO_PRICE = int(os.getenv("PROMO_PRICE", "50"))   # Stars for one promotion
+PROMO_DAYS  = int(os.getenv("PROMO_DAYS", "3"))     # how long a promotion runs
+PROMO_MAX_PER_USER = int(os.getenv("PROMO_MAX_PER_USER", "5"))   # active promos per user
+PROMO_MAX_SHOWN = int(os.getenv("PROMO_MAX_SHOWN", "3"))         # promoted slots per search
+PROMO_REPORT_HIDE = int(os.getenv("PROMO_REPORT_HIDE", "5"))     # auto-hide after N reports
+
 # ─── Access gate ──────────────────────────────────────────────────────────────
 # Admins bypass automatically; everyone else needs the access code. BOTH live in
 # env vars so only the operator can change them (never hard-coded in the client).
@@ -304,6 +311,25 @@ def init_db():
                    ts INTEGER NOT NULL)"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_exp ON subs(expires_at);")
+        # Promoted gifts. One paid promotion = one row. status: pending|active|removed.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS promos (
+                   id TEXT PRIMARY KEY,
+                   uid TEXT NOT NULL,
+                   collection TEXT NOT NULL,
+                   gift_id TEXT,
+                   slug TEXT,
+                   model TEXT,
+                   symbol TEXT,
+                   backdrop TEXT,
+                   marketplace TEXT,
+                   charge_id TEXT,
+                   status TEXT NOT NULL,
+                   reports INTEGER DEFAULT 0,
+                   ts INTEGER NOT NULL,
+                   expires_at INTEGER DEFAULT 0)"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_promos_gift ON promos(gift_id, status, expires_at);")
         # Indexes — keep the analytics/referral queries fast as data grows.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ref_uid ON referrals(uid);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_members_last ON members(last_seen);")
@@ -605,6 +631,92 @@ def set_vanity(uid, code):
         return False, "error"
 
 
+# ─── Promoted gifts ──────────────────────────────────────────────────────────
+def _promo_count_active(uid):
+    now = int(time.time())
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM promos WHERE uid=? AND status='active' AND expires_at>?",
+                (str(uid), now)).fetchone()
+        return int(row["n"]) if row else 0
+    except Exception:
+        return 0
+
+def _promo_create(uid, fields):
+    """Insert a pending promo (activated when its Stars payment lands). Returns id."""
+    pid = _secrets.token_hex(8)
+    try:
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO promos(id, uid, collection, gift_id, slug, model, symbol,
+                       backdrop, marketplace, charge_id, status, reports, ts, expires_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (pid, str(uid), fields["collection"], fields.get("gift_id", ""), fields.get("slug", ""),
+                 fields.get("model", ""), fields.get("symbol", ""), fields.get("backdrop", ""),
+                 fields.get("marketplace", ""), "", "pending", 0, int(time.time()), 0))
+            conn.commit()
+        return pid
+    except Exception as e:
+        log.error("promo_create failed: %s", e)
+        return None
+
+def _promo_activate(pid, uid, charge_id):
+    exp = int(time.time()) + PROMO_DAYS * 86400
+    try:
+        with db() as conn:
+            conn.execute(
+                "UPDATE promos SET status='active', charge_id=?, expires_at=? WHERE id=? AND uid=?",
+                (charge_id or "", exp, pid, str(uid)))
+            conn.commit()
+        return exp
+    except Exception as e:
+        log.error("promo_activate failed: %s", e)
+        return 0
+
+def _promo_active_for(gift_id):
+    """Active, non-expired, not-hidden promos for a gift collection."""
+    if not gift_id:
+        return []
+    now = int(time.time())
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT id, collection, gift_id, slug, model, symbol, backdrop, marketplace
+                   FROM promos WHERE gift_id=? AND status='active' AND expires_at>? AND reports<?
+                   ORDER BY ts ASC LIMIT ?""",
+                (str(gift_id), now, PROMO_REPORT_HIDE, PROMO_MAX_SHOWN)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.info("promo_active_for error: %s", e)
+        return []
+
+def _promo_report(pid):
+    try:
+        with db() as conn:
+            conn.execute("UPDATE promos SET reports=reports+1 WHERE id=?", (pid,))
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+def _promo_get(pid):
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT id, uid, charge_id, status FROM promos WHERE id=?", (pid,)).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        return None
+
+def _promo_set_status(pid, status):
+    try:
+        with db() as conn:
+            conn.execute("UPDATE promos SET status=? WHERE id=?", (status, pid))
+            conn.commit()
+    except Exception as e:
+        log.error("promo_set_status failed: %s", e)
+
+
 def _bcast_remove(uid):
     try:
         with db() as conn:
@@ -862,7 +974,9 @@ async def _record_payment(action):
     kind = parts[0] if parts else ""
     charge_id = ""
     try:
-        charge_id = action.charge.provider_charge_id or action.charge.id
+        # The Telegram charge id (the stx... value) is what botCancelStarsSubscription
+        # and refundStarPayment expect — NOT provider_charge_id (caused CHARGE_ID_INVALID).
+        charge_id = action.charge.id or action.charge.provider_charge_id
     except Exception:
         pass
     if kind == "sub" and len(parts) >= 3:
@@ -894,6 +1008,15 @@ async def _record_payment(action):
         _sub_set(uid, tier, expires, charge_id)
         log.info("Stars subscription active: uid=%s tier=%s until=%s", uid, tier, expires)
         await _send_sub_confirmation(uid, tier)
+    elif kind == "promo" and len(parts) >= 3:
+        pid, uid = parts[1], parts[2]
+        exp = _promo_activate(pid, uid, charge_id)
+        log.info("promotion active: id=%s uid=%s until=%s", pid, uid, exp)
+        try:
+            await _bot_api("sendMessage", {"chat_id": int(uid),
+                "text": f"Your gift promotion is live for the next {PROMO_DAYS} days. It will appear at the top of matching scouts."})
+        except Exception:
+            pass
     else:
         log.info("payment with unrecognized payload: %r", payload)
 
@@ -2322,7 +2445,8 @@ async def subscription(x_init_data: str = Header(default="", alias="X-Init-Data"
     uid = verify_init_data(x_init_data)
     tier, exp = sub_info(uid)
     return {"tier": tier, "expires_at": exp, "caps": TIER_CAPS,
-            "prices": {"plus": STARS_PLUS, "pro": STARS_PRO}}
+            "prices": {"plus": STARS_PLUS, "pro": STARS_PRO},
+            "promo_price": PROMO_PRICE, "promo_days": PROMO_DAYS}
 
 @app.post("/api/create-invoice")
 async def create_invoice(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
@@ -2383,6 +2507,97 @@ async def consent(x_init_data: str = Header(default="", alias="X-Init-Data")):
         log.info("consent optout-clear skipped: %s", e)
     _bcast_add(uid)
     return {"ok": True}
+
+
+# ─── Promoted gifts (one-time Stars, available to everyone) ──────────────────
+def _collection_by_gift_id(gift_id):
+    for c in (cache_get("collections") or []):
+        if str(c.get("gift_id")) == str(gift_id):
+            return c
+    return None
+
+@app.post("/api/promote/create")
+async def promote_create(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Create a pending promotion and return a one-time Stars invoice link. The promo
+    goes live only when the payment lands. Available to all tiers."""
+    uid = verify_init_data(x_init_data)
+    if not uid:
+        return {"ok": False, "error": "auth"}
+    if _promo_count_active(uid) >= PROMO_MAX_PER_USER:
+        return {"ok": False, "error": "limit"}
+    gift_id = _digits(payload.get("gift_id"))
+    col = _collection_by_gift_id(gift_id)
+    if not col:
+        return {"ok": False, "error": "collection"}   # must be a gift in our index
+    mkt = _clamp(payload.get("marketplace"), 20)
+    if mkt not in ("Telegram", "Fragment"):
+        return {"ok": False, "error": "marketplace"}
+    fields = {
+        "collection": _clamp(col.get("name"), 64),
+        "gift_id": gift_id,
+        "slug": _safe_slug(col.get("slug") or payload.get("slug") or ""),
+        "model": _clamp(payload.get("model"), 80),
+        "symbol": _clamp(payload.get("symbol"), 80),
+        "backdrop": _clamp(payload.get("backdrop"), 80),
+        "marketplace": mkt,
+    }
+    pid = _promo_create(uid, fields)
+    if not pid:
+        return {"ok": False, "error": "create"}
+    title = "GiftTrove promotion"
+    bits = [fields["collection"]] + [b for b in (fields["model"], fields["symbol"], fields["backdrop"]) if b]
+    desc = f"Promote {' · '.join(bits)} on {mkt} for {PROMO_DAYS} days."
+    resp = await _bot_api("createInvoiceLink", {
+        "title": title,
+        "description": desc[:255],
+        "payload": f"promo:{pid}:{uid}",
+        "currency": "XTR",
+        "prices": [{"label": f"{PROMO_DAYS}-day promotion", "amount": PROMO_PRICE}],
+    })
+    if resp and resp.get("ok") and resp.get("result"):
+        return {"ok": True, "link": resp["result"], "id": pid, "price": PROMO_PRICE}
+    log.error("promo createInvoiceLink failed: %s", resp)
+    return {"ok": False, "error": "invoice"}
+
+@app.get("/api/promos")
+async def promos(gift_id: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Active promotions for a gift collection, to blend at the top of a scout.
+    Scout Pro members get none (their perk is an ad-free scout)."""
+    uid = verify_init_data(x_init_data)
+    if uid and get_tier(uid) == "pro":
+        return {"promos": []}
+    return {"promos": _promo_active_for(_digits(gift_id)), "redirect": MINIAPP_URL}
+
+@app.post("/api/promote/report")
+async def promote_report(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    pid = _clamp(payload.get("id"), 32)
+    if not pid:
+        return {"ok": False}
+    _promo_report(pid)
+    return {"ok": True}
+
+@app.post("/api/promote/remove")
+async def promote_remove(payload: dict = Body(...), code: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Admin kill-switch: remove a promotion and refund its Stars."""
+    verified = verify_init_data(x_init_data)
+    code_ok = bool(ADMIN_CODE) and _clamp(code, 60) == ADMIN_CODE
+    id_ok = (verified is None) or (verified == ANALYTICS_ADMIN_ID)
+    if not (code_ok and id_ok):
+        return {"ok": False, "error": "forbidden"}
+    pid = _clamp(payload.get("id"), 32)
+    promo = _promo_get(pid)
+    if not promo:
+        return {"ok": False, "error": "missing"}
+    _promo_set_status(pid, "removed")
+    refunded = False
+    if promo.get("charge_id"):
+        try:
+            r = await _bot_api("refundStarPayment",
+                               {"user_id": int(promo["uid"]), "telegram_payment_charge_id": promo["charge_id"]})
+            refunded = bool(r and r.get("ok"))
+        except Exception as e:
+            log.warning("promo refund failed: %s", e)
+    return {"ok": True, "refunded": refunded}
 
 
 # ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
