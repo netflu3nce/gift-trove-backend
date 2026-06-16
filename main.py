@@ -80,7 +80,7 @@ PROMO_REPORT_HIDE = int(os.getenv("PROMO_REPORT_HIDE", "5"))     # auto-hide aft
 # they referred — but ONLY while the referrer is themselves an active Pro.
 AFFILIATE_PCT = int(os.getenv("AFFILIATE_PCT", "30"))            # % of each sub payment
 AFFILIATE_MIN_WITHDRAW = int(os.getenv("AFFILIATE_MIN_WITHDRAW", "1000"))  # Stars before payout
-STAR_TO_TON = float(os.getenv("STAR_TO_TON", "0"))              # optional Stars->TON rate for display
+STAR_TO_TON = float(os.getenv("STAR_TO_TON", "0.005"))           # ~net Fragment rate (≈200★/TON); GRAM==TON
 
 # ─── Access gate ──────────────────────────────────────────────────────────────
 # Admins bypass automatically; everyone else needs the access code. BOTH live in
@@ -203,6 +203,19 @@ class _DB:
         except Exception:
             pass
         self.close()
+
+
+def _existing_columns(conn, table):
+    """Column names of a table, for both Postgres and SQLite."""
+    try:
+        if USE_PG:
+            rows = conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name=?", (table,)).fetchall()
+            return {r["column_name"] for r in rows}
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {r["name"] for r in rows}
+    except Exception:
+        return set()
 
 
 def db():
@@ -339,11 +352,12 @@ def init_db():
                    expires_at INTEGER DEFAULT 0)"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_promos_gift ON promos(gift_id, status, expires_at);")
-        for col in ("amount TEXT", "currency TEXT", "link TEXT"):   # for DBs created before these existed
-            try:
-                conn.execute(f"ALTER TABLE promos ADD COLUMN {col}")
-            except Exception:
-                pass
+        # Backfill columns on DBs created before they existed. We check first so we
+        # never issue a duplicate ALTER (which on Postgres aborts the whole transaction).
+        _have = _existing_columns(conn, "promos")
+        for _col, _typ in (("amount", "TEXT"), ("currency", "TEXT"), ("link", "TEXT")):
+            if _col not in _have:
+                conn.execute(f"ALTER TABLE promos ADD COLUMN {_col} {_typ}")
         # Affiliate earnings ledger (Scout Pro only). One row per credited payment.
         conn.execute(
             """CREATE TABLE IF NOT EXISTS affiliate_earnings (
@@ -720,6 +734,36 @@ def _promo_set_charge(pid, charge_id):
     except Exception as e:
         log.error("promo_set_charge failed: %s", e)
 
+def _promo_set_price(pid, amount, currency):
+    try:
+        with db() as conn:
+            conn.execute("UPDATE promos SET amount=?, currency=? WHERE id=?", (str(amount), currency or "", pid))
+            conn.commit()
+    except Exception as e:
+        log.error("promo_set_price failed: %s", e)
+
+async def _promo_fetch_price(gift_id):
+    """Cheapest current Telegram listing for a collection -> (amount, currency).
+    Used to auto-fill a promoted gift's price so it stays accurate."""
+    GetResale = _payments("GetResaleStarGiftsRequest")
+    if client is None or not GetResale or not gift_id:
+        return ("", "")
+    try:
+        res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0,
+                                              sort_by_price=True, offset="", limit=1))
+        g = getattr(res, "gifts", []) or []
+        if not g:
+            return ("", "")
+        item = serialize_unique(g[0])
+        price = item.get("price")
+        if price is None:
+            return ("", "")
+        cur = "Stars" if str(item.get("currency", "")).lower() in ("stars", "star", "xtr") else "GRAM"
+        return (str(price), cur)
+    except Exception as e:
+        log.info("promo price fetch failed: %s", e)
+        return ("", "")
+
 def _promo_go_live(pid):
     """Flip a reviewed promo to active and start its clock."""
     exp = int(time.time()) + PROMO_DAYS * 86400
@@ -830,6 +874,37 @@ def _affiliate_request_payout(uid, stars, ton_address):
     except Exception as e:
         log.error("affiliate payout request failed: %s", e)
         return False
+
+def _affiliate_payouts(uid, limit=20):
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT id, stars, ton_address, status, ts FROM affiliate_payouts WHERE uid=? ORDER BY ts DESC LIMIT ?",
+                (str(uid), int(limit))).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+def _affiliate_series(uid, days=30):
+    """Daily earned-Stars buckets for the last `days` (oldest->newest)."""
+    now = int(time.time())
+    start = now - days * 86400
+    buckets = {}
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT stars, ts FROM affiliate_earnings WHERE referrer=? AND ts>=?",
+                (str(uid), start)).fetchall()
+        for r in rows:
+            day = (int(r["ts"]) - start) // 86400
+            buckets[day] = buckets.get(day, 0) + int(r["stars"] or 0)
+    except Exception as e:
+        log.info("affiliate_series error: %s", e)
+    out = []
+    for d in range(days):
+        ts = start + d * 86400
+        out.append({"t": ts, "v": buckets.get(d, 0)})
+    return out
 
 
 def _bcast_remove(uid):
@@ -1241,6 +1316,13 @@ async def _record_payment(action):
                 pass
         else:
             exp = _promo_activate(pid, uid, charge_id)
+            # Auto-source the live Telegram floor price so the card shows real value.
+            try:
+                amt, cur = await _promo_fetch_price(promo.get("gift_id"))
+                if amt:
+                    _promo_set_price(pid, amt, cur)
+            except Exception as e:
+                log.info("promo auto-price skipped: %s", e)
             log.info("promotion active: id=%s uid=%s until=%s", pid, uid, exp)
             try:
                 await _bot_api("sendMessage", {"chat_id": int(uid),
@@ -2879,6 +2961,8 @@ async def affiliate(x_init_data: str = Header(default="", alias="X-Init-Data")):
         "earned": s["earned"], "paid": s["paid"], "pending": s["pending"],
         "available": s["available"], "referees": s["referees"], "payers": s["payers"],
         "ton_value": ton_val, "gram_value": gram_val,
+        "payouts": _affiliate_payouts(uid), "series": _affiliate_series(uid),
+        "star_to_gram": STAR_TO_TON,
     }
 
 @app.post("/api/affiliate/withdraw")
@@ -2903,6 +2987,24 @@ async def affiliate_withdraw(payload: dict = Body(...), x_init_data: str = Heade
     except Exception:
         pass
     return {"ok": True, "requested": s["available"]}
+
+@app.post("/api/affiliate/mark-paid")
+async def affiliate_mark_paid(payload: dict = Body(...), code: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Admin: mark a payout request settled (after sending GRAM from the escrow wallet)."""
+    verified = verify_init_data(x_init_data)
+    code_ok = bool(ADMIN_CODE) and _clamp(code, 60) == ADMIN_CODE
+    id_ok = (verified is None) or (verified == ANALYTICS_ADMIN_ID)
+    if not (code_ok and id_ok):
+        return {"ok": False, "error": "forbidden"}
+    pid = _clamp(payload.get("id"), 32)
+    try:
+        with db() as conn:
+            conn.execute("UPDATE affiliate_payouts SET status='paid' WHERE id=?", (pid,))
+            conn.commit()
+        return {"ok": True}
+    except Exception as e:
+        log.error("mark-paid failed: %s", e)
+        return {"ok": False}
 
 
 # ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
