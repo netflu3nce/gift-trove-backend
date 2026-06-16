@@ -67,7 +67,7 @@ MTPROTO_TIMEOUT = int(os.getenv("MTPROTO_TIMEOUT", "18"))   # seconds per call
 STARS_PLUS = int(os.getenv("STARS_PLUS", "150"))   # Scout+  / month
 STARS_PRO  = int(os.getenv("STARS_PRO", "500"))    # Scout Pro / month
 SUB_PERIOD = 2592000                                # 30 days, the only allowed period
-TIER_CAPS  = {"free": 1, "plus": 5, "pro": 999}     # max selections per filter type
+TIER_CAPS  = {"free": 1, "plus": 7, "pro": 999}     # max selections per filter type
 
 # ─── Promoted gifts (one-time Stars, all tiers) ─────────────────────────────────
 PROMO_PRICE = int(os.getenv("PROMO_PRICE", "50"))   # Stars for one promotion
@@ -2647,6 +2647,10 @@ async def analytics(uid: str = Query(""), code: str = Query(""), range_q: str = 
             out["unique_gifts"] = q("SELECT COUNT(*) c FROM gift_searches")
             out["referrals_total"] = q("SELECT COUNT(*) c FROM referrals")
             out["unique_referrers"] = q("SELECT COUNT(DISTINCT uid) c FROM referrals")
+            # Membership breakdown (active subscriptions; everyone else is free).
+            out["subs_plus"] = q("SELECT COUNT(*) c FROM subs WHERE tier='plus' AND expires_at>?", (now,))
+            out["subs_pro"] = q("SELECT COUNT(*) c FROM subs WHERE tier='pro' AND expires_at>?", (now,))
+            out["subs_free"] = max(0, (out["members_total"] or 0) - out["subs_plus"] - out["subs_pro"])
             out["shares_total"] = q("SELECT COALESCE(SUM(count),0) c FROM gift_shares")
             out["shares_24h"] = q("SELECT COUNT(*) c FROM events WHERE kind='share' AND ts>?", (day,))
             out["shares_7d"] = q("SELECT COUNT(*) c FROM events WHERE kind='share' AND ts>?", (week,))
@@ -2773,9 +2777,9 @@ async def create_invoice(payload: dict = Body(...), x_init_data: str = Header(de
         return {"ok": False, "error": "tier"}
     price = STARS_PLUS if tier == "plus" else STARS_PRO
     title = "GiftTrove Scout+" if tier == "plus" else "GiftTrove Scout Pro"
-    desc = ("Up to 5 of each filter, a custom referral code, and new perks as they land."
+    desc = ("Up to 7 of each filter, a custom referral code, and new perks as they land."
             if tier == "plus" else
-            "Unlimited filters, a custom referral code, and priority on new perks.")
+            "Unlimited filters, a custom referral code, the 30% affiliate program, and priority on new perks.")
     resp = await _bot_api("createInvoiceLink", {
         "title": title,
         "description": desc,
@@ -2837,8 +2841,12 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
         return {"ok": False, "error": "auth"}
     gift_id = _digits(payload.get("gift_id"))
     col = _collection_by_gift_id(gift_id)
-    if not col:
-        return {"ok": False, "error": "collection"}   # must be a gift in our index
+    # Cache can be cold right after a deploy; fall back to the name/slug the client
+    # already resolved so a valid gift is never wrongly rejected.
+    name = _clamp((col or {}).get("name") or payload.get("name"), 64)
+    slug = _safe_slug((col or {}).get("slug") or payload.get("slug") or "")
+    if not gift_id or not name:
+        return {"ok": False, "error": "collection"}
     mkt = _clamp(payload.get("marketplace"), 20)
     if mkt not in ("Telegram", "Fragment"):
         return {"ok": False, "error": "marketplace"}
@@ -2852,9 +2860,9 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
             return {"ok": False, "error": "domain"}
     # No amount / no free-form link for Telegram: the bot sources the price itself.
     fields = {
-        "collection": _clamp(col.get("name"), 64),
+        "collection": name,
         "gift_id": gift_id,
-        "slug": _safe_slug(col.get("slug") or payload.get("slug") or ""),
+        "slug": slug,
         "model": _clamp(payload.get("model"), 80),
         "symbol": _clamp(payload.get("symbol"), 80),
         "backdrop": _clamp(payload.get("backdrop"), 80),
