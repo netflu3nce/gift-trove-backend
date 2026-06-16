@@ -64,17 +64,23 @@ MTPROTO_TIMEOUT = int(os.getenv("MTPROTO_TIMEOUT", "18"))   # seconds per call
 # (model / symbol / backdrop) a tier may apply at once. Enforced SERVER-SIDE so a
 # modified client can't bypass it. Telegram Stars subscriptions currently allow
 # only a 30-day period (2592000s).
-STARS_PLUS = int(os.getenv("STARS_PLUS", "100"))   # Scout+  / month
-STARS_PRO  = int(os.getenv("STARS_PRO", "300"))    # Scout Pro / month
+STARS_PLUS = int(os.getenv("STARS_PLUS", "150"))   # Scout+  / month
+STARS_PRO  = int(os.getenv("STARS_PRO", "500"))    # Scout Pro / month
 SUB_PERIOD = 2592000                                # 30 days, the only allowed period
 TIER_CAPS  = {"free": 1, "plus": 5, "pro": 999}     # max selections per filter type
 
 # ─── Promoted gifts (one-time Stars, all tiers) ─────────────────────────────────
 PROMO_PRICE = int(os.getenv("PROMO_PRICE", "50"))   # Stars for one promotion
 PROMO_DAYS  = int(os.getenv("PROMO_DAYS", "3"))     # how long a promotion runs
-PROMO_MAX_PER_USER = int(os.getenv("PROMO_MAX_PER_USER", "5"))   # active promos per user
 PROMO_MAX_SHOWN = int(os.getenv("PROMO_MAX_SHOWN", "3"))         # promoted slots per search
 PROMO_REPORT_HIDE = int(os.getenv("PROMO_REPORT_HIDE", "5"))     # auto-hide after N reports
+
+# ─── Affiliate program (Scout Pro only) ─────────────────────────────────────────
+# A Pro member earns a recurring cut of every subscription payment made by users
+# they referred — but ONLY while the referrer is themselves an active Pro.
+AFFILIATE_PCT = int(os.getenv("AFFILIATE_PCT", "30"))            # % of each sub payment
+AFFILIATE_MIN_WITHDRAW = int(os.getenv("AFFILIATE_MIN_WITHDRAW", "1000"))  # Stars before payout
+STAR_TO_TON = float(os.getenv("STAR_TO_TON", "0"))              # optional Stars->TON rate for display
 
 # ─── Access gate ──────────────────────────────────────────────────────────────
 # Admins bypass automatically; everyone else needs the access code. BOTH live in
@@ -323,6 +329,9 @@ def init_db():
                    symbol TEXT,
                    backdrop TEXT,
                    marketplace TEXT,
+                   amount TEXT,
+                   currency TEXT,
+                   link TEXT,
                    charge_id TEXT,
                    status TEXT NOT NULL,
                    reports INTEGER DEFAULT 0,
@@ -330,6 +339,34 @@ def init_db():
                    expires_at INTEGER DEFAULT 0)"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_promos_gift ON promos(gift_id, status, expires_at);")
+        for col in ("amount TEXT", "currency TEXT", "link TEXT"):   # for DBs created before these existed
+            try:
+                conn.execute(f"ALTER TABLE promos ADD COLUMN {col}")
+            except Exception:
+                pass
+        # Affiliate earnings ledger (Scout Pro only). One row per credited payment.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS affiliate_earnings (
+                   id TEXT PRIMARY KEY,
+                   referrer TEXT NOT NULL,
+                   referee TEXT NOT NULL,
+                   tier TEXT,
+                   stars INTEGER NOT NULL,
+                   charge_id TEXT,
+                   ts INTEGER NOT NULL)"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_aff_ref ON affiliate_earnings(referrer);")
+        # Withdrawal requests. status: requested|paid|rejected.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS affiliate_payouts (
+                   id TEXT PRIMARY KEY,
+                   uid TEXT NOT NULL,
+                   stars INTEGER NOT NULL,
+                   ton_address TEXT,
+                   status TEXT NOT NULL,
+                   ts INTEGER NOT NULL)"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_aff_pay ON affiliate_payouts(uid, status);")
         # Indexes — keep the analytics/referral queries fast as data grows.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ref_uid ON referrals(uid);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_members_last ON members(last_seen);")
@@ -650,11 +687,12 @@ def _promo_create(uid, fields):
         with db() as conn:
             conn.execute(
                 """INSERT INTO promos(id, uid, collection, gift_id, slug, model, symbol,
-                       backdrop, marketplace, charge_id, status, reports, ts, expires_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       backdrop, marketplace, amount, currency, link, charge_id, status, reports, ts, expires_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (pid, str(uid), fields["collection"], fields.get("gift_id", ""), fields.get("slug", ""),
                  fields.get("model", ""), fields.get("symbol", ""), fields.get("backdrop", ""),
-                 fields.get("marketplace", ""), "", "pending", 0, int(time.time()), 0))
+                 fields.get("marketplace", ""), fields.get("amount", ""), fields.get("currency", ""),
+                 fields.get("link", ""), "", "pending", 0, int(time.time()), 0))
             conn.commit()
         return pid
     except Exception as e:
@@ -682,7 +720,8 @@ def _promo_active_for(gift_id):
     try:
         with db() as conn:
             rows = conn.execute(
-                """SELECT id, collection, gift_id, slug, model, symbol, backdrop, marketplace
+                """SELECT id, collection, gift_id, slug, model, symbol, backdrop, marketplace,
+                          amount, currency, link
                    FROM promos WHERE gift_id=? AND status='active' AND expires_at>? AND reports<?
                    ORDER BY ts ASC LIMIT ?""",
                 (str(gift_id), now, PROMO_REPORT_HIDE, PROMO_MAX_SHOWN)).fetchall()
@@ -715,6 +754,60 @@ def _promo_set_status(pid, status):
             conn.commit()
     except Exception as e:
         log.error("promo_set_status failed: %s", e)
+
+
+# ─── Affiliate program (Scout Pro only) ──────────────────────────────────────
+def _referrer_of(uid):
+    """The uid that referred this user, if any."""
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT referred_by FROM referrals WHERE uid=? LIMIT 1", (str(uid),)).fetchone()
+        return row["referred_by"] if row else None
+    except Exception:
+        return None
+
+def _affiliate_credit(referrer, referee, tier, stars, charge_id):
+    if stars <= 0:
+        return
+    try:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO affiliate_earnings(id, referrer, referee, tier, stars, charge_id, ts) VALUES(?,?,?,?,?,?,?)",
+                (_secrets.token_hex(8), str(referrer), str(referee), tier or "", int(stars), charge_id or "", int(time.time())))
+            conn.commit()
+        log.info("affiliate credit: referrer=%s referee=%s +%s stars", referrer, referee, stars)
+    except Exception as e:
+        log.error("affiliate_credit failed: %s", e)
+
+def _affiliate_stats(uid):
+    """Earned / paid-out / pending / available, plus simple counts."""
+    out = {"earned": 0, "paid": 0, "pending": 0, "available": 0, "referees": 0, "payers": 0}
+    try:
+        with db() as conn:
+            r = conn.execute("SELECT COALESCE(SUM(stars),0) s, COUNT(DISTINCT referee) c FROM affiliate_earnings WHERE referrer=?", (str(uid),)).fetchone()
+            out["earned"] = int(r["s"] or 0); out["payers"] = int(r["c"] or 0)
+            p = conn.execute("SELECT status, COALESCE(SUM(stars),0) s FROM affiliate_payouts WHERE uid=? GROUP BY status", (str(uid),)).fetchall()
+            for row in p:
+                if row["status"] == "paid": out["paid"] += int(row["s"] or 0)
+                elif row["status"] == "requested": out["pending"] += int(row["s"] or 0)
+            rc = conn.execute("SELECT COUNT(*) c FROM referrals WHERE referred_by=?", (str(uid),)).fetchone()
+            out["referees"] = int(rc["c"] or 0)
+    except Exception as e:
+        log.info("affiliate_stats error: %s", e)
+    out["available"] = max(0, out["earned"] - out["paid"] - out["pending"])
+    return out
+
+def _affiliate_request_payout(uid, stars, ton_address):
+    try:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO affiliate_payouts(id, uid, stars, ton_address, status, ts) VALUES(?,?,?,?,?,?)",
+                (_secrets.token_hex(8), str(uid), int(stars), ton_address or "", "requested", int(time.time())))
+            conn.commit()
+        return True
+    except Exception as e:
+        log.error("affiliate payout request failed: %s", e)
+        return False
 
 
 def _bcast_remove(uid):
@@ -939,6 +1032,40 @@ async def _register_bot_handlers():
                 except Exception:
                     pass
 
+    # ── Inline search: @gifttrovebot <gift> [backdrop] [model] [symbol] ──────
+    # Works in any DM / group. Each result opens the Mini App on that collection.
+    @bot.on(events.InlineQuery)
+    async def _inline(event):
+        q = (event.text or "").strip()
+        cols = cache_get("collections") or []
+        ql = q.lower()
+        first = ql.split()[0] if ql else ""
+        matches = ([c for c in cols if first and first in (c.get("name", "").lower())][:8]
+                   if first else cols[:8])
+        builder = event.builder
+        results = []
+        try:
+            for c in matches:
+                gid = c.get("gift_id")
+                name = c.get("name", "Gift")
+                link = f"{MINIAPP_URL}?startapp=q_{gid}" if gid else MINIAPP_URL
+                results.append(builder.article(
+                    title=name,
+                    description=f"Scout {name} live across marketplaces",
+                    text=f"{name} on GiftTrove\nScout live listings across Telegram marketplaces.",
+                    buttons=[Button.url("Open in GiftTrove", link)],
+                ))
+            if not results:
+                results.append(builder.article(
+                    title="Open GiftTrove",
+                    description="Scout unique Telegram gifts",
+                    text="Scout unique Telegram gifts on GiftTrove.",
+                    buttons=[Button.url("Open GiftTrove", MINIAPP_URL)],
+                ))
+            await event.answer(results, cache_time=30, private=False)
+        except Exception as e:
+            log.info("inline answer failed: %s", e)
+
     # ── Stars payments ──────────────────────────────────────────────────────
     # Invoices are created via the Bot API (createInvoiceLink), but the resulting
     # updates flow to this MTProto bot. We must approve the pre-checkout within
@@ -1007,6 +1134,15 @@ async def _record_payment(action):
             expires = int(time.time()) + SUB_PERIOD
         _sub_set(uid, tier, expires, charge_id)
         log.info("Stars subscription active: uid=%s tier=%s until=%s", uid, tier, expires)
+        # Affiliate: pay the referrer a recurring cut — but only while THEY are Pro.
+        try:
+            ref = _referrer_of(uid)
+            if ref and str(ref) != str(uid) and get_tier(ref) == "pro":
+                paid = getattr(action, "total_amount", 0) or (STARS_PRO if tier == "pro" else STARS_PLUS)
+                cut = int(int(paid) * AFFILIATE_PCT / 100)
+                _affiliate_credit(ref, uid, tier, cut, charge_id)
+        except Exception as e:
+            log.info("affiliate credit skipped: %s", e)
         await _send_sub_confirmation(uid, tier)
     elif kind == "promo" and len(parts) >= 3:
         pid, uid = parts[1], parts[2]
@@ -2523,8 +2659,6 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
     uid = verify_init_data(x_init_data)
     if not uid:
         return {"ok": False, "error": "auth"}
-    if _promo_count_active(uid) >= PROMO_MAX_PER_USER:
-        return {"ok": False, "error": "limit"}
     gift_id = _digits(payload.get("gift_id"))
     col = _collection_by_gift_id(gift_id)
     if not col:
@@ -2532,6 +2666,12 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
     mkt = _clamp(payload.get("marketplace"), 20)
     if mkt not in ("Telegram", "Fragment"):
         return {"ok": False, "error": "marketplace"}
+    cur = _clamp(payload.get("currency"), 8)
+    if cur not in ("GRAM", "TON", "Stars", ""):
+        cur = "GRAM"
+    plink = _clamp(payload.get("link"), 256)
+    if plink and not (plink.startswith("https://t.me/") or plink.startswith("https://fragment.com/")):
+        plink = ""   # only allow Telegram / Fragment deep links
     fields = {
         "collection": _clamp(col.get("name"), 64),
         "gift_id": gift_id,
@@ -2540,6 +2680,9 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
         "symbol": _clamp(payload.get("symbol"), 80),
         "backdrop": _clamp(payload.get("backdrop"), 80),
         "marketplace": mkt,
+        "amount": _clamp(str(payload.get("amount", "")), 24),
+        "currency": cur,
+        "link": plink,
     }
     pid = _promo_create(uid, fields)
     if not pid:
@@ -2619,6 +2762,48 @@ async def star_balance(uid: str = Query(""), code: str = Query(""), x_init_data:
     except Exception as e:
         log.info("star-balance error: %s", e)
         return {"ok": False, "error": "unavailable"}
+
+
+# ─── Affiliate program endpoints (Scout Pro only) ────────────────────────────
+@app.get("/api/affiliate")
+async def affiliate(x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """A Pro member's affiliate dashboard: earnings, pending, available, counts."""
+    uid = verify_init_data(x_init_data)
+    if not uid:
+        return {"ok": False, "error": "auth"}
+    tier = get_tier(uid)
+    s = _affiliate_stats(uid)
+    ton_val = round(s["available"] * STAR_TO_TON, 4) if STAR_TO_TON > 0 else None
+    return {
+        "ok": True, "is_pro": tier == "pro", "pct": AFFILIATE_PCT,
+        "min_withdraw": AFFILIATE_MIN_WITHDRAW,
+        "earned": s["earned"], "paid": s["paid"], "pending": s["pending"],
+        "available": s["available"], "referees": s["referees"], "payers": s["payers"],
+        "ton_value": ton_val,
+    }
+
+@app.post("/api/affiliate/withdraw")
+async def affiliate_withdraw(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Request a payout. Pro-only; needs >= AFFILIATE_MIN_WITHDRAW available Stars.
+    The amount is moved to 'pending' (escrow) until the team settles it in TON."""
+    uid = verify_init_data(x_init_data)
+    if not uid:
+        return {"ok": False, "error": "auth"}
+    if get_tier(uid) != "pro":
+        return {"ok": False, "error": "pro"}
+    addr = _clamp(payload.get("ton_address"), 80)
+    if not addr:
+        return {"ok": False, "error": "address"}
+    s = _affiliate_stats(uid)
+    if s["available"] < AFFILIATE_MIN_WITHDRAW:
+        return {"ok": False, "error": "min", "available": s["available"], "min": AFFILIATE_MIN_WITHDRAW}
+    if not _affiliate_request_payout(uid, s["available"], addr):
+        return {"ok": False, "error": "failed"}
+    try:
+        await notify_admin(f"Affiliate payout requested: uid={uid} stars={s['available']} ton={addr}", level="info")
+    except Exception:
+        pass
+    return {"ok": True, "requested": s["available"]}
 
 
 # ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
@@ -2757,7 +2942,9 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
     segs.append(("text", f"{market}{(_mid + price) if price else ''}"))
     segs.append(("text", "\n\nScout unique Telegram gifts on GiftTrove"))
     if link:
-        segs.append(("text", f"\n{link}"))
+        # Show a clean clickable phrase instead of a raw https:// URL.
+        segs.append(("text", "\n"))
+        segs.append(("link", f"View on {market}", link))
 
     text, off, entities = "", 0, []
     for seg in segs:
@@ -2765,6 +2952,8 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
         ln = _u16len(s)
         if seg[0] == "bold":
             entities.append({"type": "bold", "offset": off, "length": ln})
+        elif seg[0] == "link":
+            entities.append({"type": "text_link", "offset": off, "length": ln, "url": seg[2]})
         text += s
         off += ln
 
@@ -2777,7 +2966,7 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
         "input_message_content": {
             "message_text": text,
             "entities": entities,
-            "link_preview_options": {"is_disabled": not bool(link)},
+            "link_preview_options": {"is_disabled": True},
         },
     }
     try:
