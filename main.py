@@ -2600,6 +2600,27 @@ async def promote_remove(payload: dict = Body(...), code: str = Query(""), x_ini
     return {"ok": True, "refunded": refunded}
 
 
+@app.get("/api/star-balance")
+async def star_balance(uid: str = Query(""), code: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Admin-only: the bot's current Telegram Stars balance (what @gifttrovebot has
+    earned and is holding). Gated exactly like analytics."""
+    verified = verify_init_data(x_init_data)
+    code_ok = bool(ADMIN_CODE) and _clamp(code, 60) == ADMIN_CODE
+    id_ok = (verified is None) or (verified == ANALYTICS_ADMIN_ID)
+    if not (code_ok and id_ok):
+        return {"error": "forbidden"}
+    try:
+        r = await _bot_api("getMyStarBalance", {})
+        if r and r.get("ok"):
+            res = r.get("result") or {}
+            stars = res.get("amount", res.get("star_amount", 0))
+            return {"ok": True, "stars": int(stars or 0), "nanostars": int(res.get("nanostar_amount", 0) or 0)}
+        return {"ok": False, "error": (r or {}).get("description", "unavailable")}
+    except Exception as e:
+        log.info("star-balance error: %s", e)
+        return {"ok": False, "error": "unavailable"}
+
+
 # ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
 @app.get("/api/userdata")
 async def get_userdata(uid: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
