@@ -712,6 +712,26 @@ def _promo_activate(pid, uid, charge_id):
         log.error("promo_activate failed: %s", e)
         return 0
 
+def _promo_set_charge(pid, charge_id):
+    try:
+        with db() as conn:
+            conn.execute("UPDATE promos SET charge_id=? WHERE id=?", (charge_id or "", pid))
+            conn.commit()
+    except Exception as e:
+        log.error("promo_set_charge failed: %s", e)
+
+def _promo_go_live(pid):
+    """Flip a reviewed promo to active and start its clock."""
+    exp = int(time.time()) + PROMO_DAYS * 86400
+    try:
+        with db() as conn:
+            conn.execute("UPDATE promos SET status='active', expires_at=? WHERE id=?", (exp, pid))
+            conn.commit()
+        return exp
+    except Exception as e:
+        log.error("promo_go_live failed: %s", e)
+        return 0
+
 def _promo_active_for(gift_id):
     """Active, non-expired, not-hidden promos for a gift collection."""
     if not gift_id:
@@ -742,7 +762,9 @@ def _promo_report(pid):
 def _promo_get(pid):
     try:
         with db() as conn:
-            row = conn.execute("SELECT id, uid, charge_id, status FROM promos WHERE id=?", (pid,)).fetchone()
+            row = conn.execute(
+                """SELECT id, uid, charge_id, status, marketplace, link, slug, collection,
+                          model, symbol, backdrop, gift_id FROM promos WHERE id=?""", (pid,)).fetchone()
         return dict(row) if row else None
     except Exception:
         return None
@@ -1040,21 +1062,27 @@ async def _register_bot_handlers():
         cols = cache_get("collections") or []
         ql = q.lower()
         first = ql.split()[0] if ql else ""
-        matches = ([c for c in cols if first and first in (c.get("name", "").lower())][:8]
-                   if first else cols[:8])
+        # 1-3 best matches; tapping launches the Mini App straight onto that gift.
+        matches = ([c for c in cols if first and first in (c.get("name", "").lower())][:3]
+                   if first else cols[:3])
         builder = event.builder
         results = []
         try:
             for c in matches:
                 gid = c.get("gift_id")
                 name = c.get("name", "Gift")
+                slug = c.get("slug") or ""
                 link = f"{MINIAPP_URL}?startapp=q_{gid}" if gid else MINIAPP_URL
-                results.append(builder.article(
-                    title=name,
-                    description=f"Scout {name} live across marketplaces",
-                    text=f"{name} on GiftTrove\nScout live listings across Telegram marketplaces.",
-                    buttons=[Button.url("Open in GiftTrove", link)],
-                ))
+                thumb = f"https://nft.fragment.com/gift/{slug}-1.large.jpg" if slug else None
+                kw = {
+                    "title": name,
+                    "description": f"Scout {name} — live floor & listings",
+                    "text": f"{name} on GiftTrove\nTap to scout live listings across Telegram marketplaces.",
+                    "buttons": [Button.url(f"Open {name}", link)],
+                }
+                if thumb:
+                    kw["thumb"] = thumb
+                results.append(builder.article(**kw))
             if not results:
                 results.append(builder.article(
                     title="Open GiftTrove",
@@ -1062,9 +1090,54 @@ async def _register_bot_handlers():
                     text="Scout unique Telegram gifts on GiftTrove.",
                     buttons=[Button.url("Open GiftTrove", MINIAPP_URL)],
                 ))
-            await event.answer(results, cache_time=30, private=False)
+            await event.answer(results, cache_time=20, private=True)
         except Exception as e:
             log.info("inline answer failed: %s", e)
+
+    # ── Fragment promotion review (admin Approve / Decline buttons) ───────────
+    @bot.on(events.CallbackQuery(pattern=b"^p(approve|decline):"))
+    async def _promo_review(event):
+        if str(event.sender_id) not in ADMIN_IDS:
+            await event.answer("Not allowed.", alert=True)
+            return
+        data = event.data.decode()
+        act, pid = data.split(":", 1)
+        promo = _promo_get(pid)
+        if not promo:
+            await event.answer("Promotion not found.", alert=True)
+            return
+        if act == "papprove":
+            _promo_go_live(pid)
+            try:
+                await event.edit(f"Approved \u2014 live for {PROMO_DAYS} days.\nGift: {promo.get('collection','?')}")
+            except Exception:
+                pass
+            try:
+                await _bot_api("sendMessage", {"chat_id": int(promo["uid"]),
+                    "text": f"Your Fragment promotion was approved and is live for {PROMO_DAYS} days."})
+            except Exception:
+                pass
+        else:
+            _promo_set_status(pid, "declined")
+            refunded = False
+            if promo.get("charge_id"):
+                try:
+                    r = await _bot_api("refundStarPayment",
+                                       {"user_id": int(promo["uid"]), "telegram_payment_charge_id": promo["charge_id"]})
+                    refunded = bool(r and r.get("ok"))
+                except Exception as e:
+                    log.info("promo decline refund failed: %s", e)
+            try:
+                await event.edit("Declined." + (" Stars refunded." if refunded else ""))
+            except Exception:
+                pass
+            try:
+                await _bot_api("sendMessage", {"chat_id": int(promo["uid"]),
+                    "text": ("Your Fragment promotion was declined after review and your Stars were refunded."
+                             if refunded else "Your Fragment promotion was declined after review.")})
+            except Exception:
+                pass
+        await event.answer("Done.")
 
     # ── Stars payments ──────────────────────────────────────────────────────
     # Invoices are created via the Bot API (createInvoiceLink), but the resulting
@@ -1146,13 +1219,34 @@ async def _record_payment(action):
         await _send_sub_confirmation(uid, tier)
     elif kind == "promo" and len(parts) >= 3:
         pid, uid = parts[1], parts[2]
-        exp = _promo_activate(pid, uid, charge_id)
-        log.info("promotion active: id=%s uid=%s until=%s", pid, uid, exp)
-        try:
-            await _bot_api("sendMessage", {"chat_id": int(uid),
-                "text": f"Your gift promotion is live for the next {PROMO_DAYS} days. It will appear at the top of matching scouts."})
-        except Exception:
-            pass
+        _promo_set_charge(pid, charge_id)
+        promo = _promo_get(pid) or {}
+        if (promo.get("marketplace") or "") == "Fragment":
+            # Manual review: a human checks the Fragment link before it goes live.
+            _promo_set_status(pid, "review")
+            log.info("promotion awaiting review: id=%s uid=%s", pid, uid)
+            try:
+                await bot.send_message(
+                    int(ALERT_ADMIN_ID),
+                    f"Fragment promotion to review\nGift: {promo.get('collection','?')}\nLink: {promo.get('link','-')}\nFrom uid: {uid}",
+                    buttons=[[Button.inline("Approve", f"papprove:{pid}".encode()),
+                              Button.inline("Decline + refund", f"pdecline:{pid}".encode())]],
+                    link_preview=False)
+            except Exception as e:
+                log.info("admin review DM failed: %s", e)
+            try:
+                await _bot_api("sendMessage", {"chat_id": int(uid),
+                    "text": "Your Fragment promotion was received and is being reviewed. It goes live once approved (usually quickly)."})
+            except Exception:
+                pass
+        else:
+            exp = _promo_activate(pid, uid, charge_id)
+            log.info("promotion active: id=%s uid=%s until=%s", pid, uid, exp)
+            try:
+                await _bot_api("sendMessage", {"chat_id": int(uid),
+                    "text": f"Your gift promotion is live for the next {PROMO_DAYS} days. It will appear at the top of matching scouts."})
+            except Exception:
+                pass
     else:
         log.info("payment with unrecognized payload: %r", payload)
 
@@ -2666,12 +2760,15 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
     mkt = _clamp(payload.get("marketplace"), 20)
     if mkt not in ("Telegram", "Fragment"):
         return {"ok": False, "error": "marketplace"}
-    cur = _clamp(payload.get("currency"), 8)
-    if cur not in ("GRAM", "TON", "Stars", ""):
-        cur = "GRAM"
-    plink = _clamp(payload.get("link"), 256)
-    if plink and not (plink.startswith("https://t.me/") or plink.startswith("https://fragment.com/")):
-        plink = ""   # only allow Telegram / Fragment deep links
+    plink = ""
+    if mkt == "Fragment":
+        # Fragment listings are scraped, not API-verified, so a human approves the
+        # link first. Auto-decline anything that isn't a real fragment.com URL.
+        plink = _clamp(payload.get("link"), 256)
+        low = plink.lower()
+        if not (low.startswith("https://fragment.com/") or low.startswith("https://www.fragment.com/")):
+            return {"ok": False, "error": "domain"}
+    # No amount / no free-form link for Telegram: the bot sources the price itself.
     fields = {
         "collection": _clamp(col.get("name"), 64),
         "gift_id": gift_id,
@@ -2680,8 +2777,8 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
         "symbol": _clamp(payload.get("symbol"), 80),
         "backdrop": _clamp(payload.get("backdrop"), 80),
         "marketplace": mkt,
-        "amount": _clamp(str(payload.get("amount", "")), 24),
-        "currency": cur,
+        "amount": "",
+        "currency": "",
         "link": plink,
     }
     pid = _promo_create(uid, fields)
@@ -2756,8 +2853,9 @@ async def star_balance(uid: str = Query(""), code: str = Query(""), x_init_data:
         r = await _bot_api("getMyStarBalance", {})
         if r and r.get("ok"):
             res = r.get("result") or {}
-            stars = res.get("amount", res.get("star_amount", 0))
-            return {"ok": True, "stars": int(stars or 0), "nanostars": int(res.get("nanostar_amount", 0) or 0)}
+            stars = int(res.get("amount", res.get("star_amount", 0)) or 0)
+            gram = round(stars * STAR_TO_TON, 2) if STAR_TO_TON > 0 else None
+            return {"ok": True, "stars": stars, "nanostars": int(res.get("nanostar_amount", 0) or 0), "gram": gram}
         return {"ok": False, "error": (r or {}).get("description", "unavailable")}
     except Exception as e:
         log.info("star-balance error: %s", e)
@@ -2774,12 +2872,13 @@ async def affiliate(x_init_data: str = Header(default="", alias="X-Init-Data")):
     tier = get_tier(uid)
     s = _affiliate_stats(uid)
     ton_val = round(s["available"] * STAR_TO_TON, 4) if STAR_TO_TON > 0 else None
+    gram_val = round(s["available"] * STAR_TO_TON, 2) if STAR_TO_TON > 0 else None
     return {
         "ok": True, "is_pro": tier == "pro", "pct": AFFILIATE_PCT,
         "min_withdraw": AFFILIATE_MIN_WITHDRAW,
         "earned": s["earned"], "paid": s["paid"], "pending": s["pending"],
         "available": s["available"], "referees": s["referees"], "payers": s["payers"],
-        "ton_value": ton_val,
+        "ton_value": ton_val, "gram_value": gram_val,
     }
 
 @app.post("/api/affiliate/withdraw")
