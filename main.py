@@ -1934,31 +1934,67 @@ _marketapp_colls_cache = {}    # {"ts": float, "data": [...]}
 
 async def _marketapp_collection_address(gift_name, slug):
     """Resolve a gift name/slug to a MarketApp TON collection address.
-    Fetched once per hour; names match case-insensitively."""
+    Tries /v1/collections/gifts/ first, falls back to /v1/collections/.
+    Logs sample names on first fetch so mismatches are visible in Render logs."""
     global _marketapp_colls_cache
     now = time.time()
     if not _marketapp_colls_cache or now - _marketapp_colls_cache.get("ts", 0) > 3600:
-        try:
-            async with httpx.AsyncClient(timeout=10) as cli:
-                r = await cli.get(f"{MARKETAPP_BASE}/v1/collections/gifts/",
-                                  headers={"Authorization": MARKETAPP_TOKEN})
-            if r.status_code == 200:
-                data = r.json()
-                _marketapp_colls_cache = {"ts": now, "data": data if isinstance(data, list) else []}
-                log.info("marketapp: cached %d gift collections", len(_marketapp_colls_cache["data"]))
-            else:
-                log.info("marketapp collections fetch: status %s", r.status_code)
-        except Exception as e:
-            log.info("marketapp collections fetch failed: %s", e)
+        merged = []
+        for path in ("/v1/collections/gifts/", "/v1/collections/"):
+            try:
+                async with httpx.AsyncClient(timeout=12) as cli:
+                    r = await cli.get(f"{MARKETAPP_BASE}{path}",
+                                      headers={"Authorization": MARKETAPP_TOKEN})
+                log.info("marketapp collections %s status=%s", path, r.status_code)
+                if r.status_code == 200:
+                    data = r.json()
+                    rows = data if isinstance(data, list) else (data.get("items") or data.get("data") or [])
+                    # Log first 8 names so name-format mismatches are visible
+                    names = [c.get("name") for c in rows[:8] if isinstance(c, dict)]
+                    log.info("marketapp collections sample names: %s (total %d)", names, len(rows))
+                    for c in rows:
+                        if isinstance(c, dict) and c.get("address") and c.get("name"):
+                            merged.append(c)
+            except Exception as e:
+                log.info("marketapp collections %s failed: %s", path, e)
+        # Deduplicate by address
+        seen = set()
+        deduped = []
+        for c in merged:
+            a = c.get("address", "")
+            if a not in seen:
+                seen.add(a)
+                deduped.append(c)
+        _marketapp_colls_cache = {"ts": now, "data": deduped}
+        log.info("marketapp: total %d unique collections cached", len(deduped))
+
     colls = _marketapp_colls_cache.get("data", [])
     if not colls:
         return None
-    gname = (gift_name or "").lower().strip()
-    gslug = (slug or "").lower()
+
+    gname = (gift_name or "").strip()
+    gslug = (slug or "").strip()
+
+    # Normalise: lowercase, remove spaces and hyphens for flexible matching
+    def norm(s):
+        return _re.sub(r"[\s\-_]", "", str(s or "")).lower()
+
+    gn = norm(gname)
+    gs = norm(gslug)
+
     for c in colls:
-        cname = (c.get("name") or "").lower().strip()
-        if cname == gname or cname.replace(" ", "") == gslug or cname.replace(" ", "") == gname.replace(" ", ""):
+        cname = c.get("name") or ""
+        cn = norm(cname)
+        if cn == gn or cn == gs:
             return c.get("address")
+
+    # Substring fallback: name contained in collection name or vice-versa
+    for c in colls:
+        cn = norm(c.get("name") or "")
+        if (gn and (gn in cn or cn in gn)) or (gs and (gs in cn or cn in gs)):
+            log.info("marketapp: fuzzy match %r -> %r", gname, c.get("name"))
+            return c.get("address")
+
     return None
 
 def _marketapp_item(raw, gift_name, fallback_slug):
