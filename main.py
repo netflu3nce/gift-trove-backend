@@ -3133,7 +3133,7 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
     if not gift_id or not name:
         return {"ok": False, "error": "collection"}
     mkt = _clamp(payload.get("marketplace"), 20)
-    if mkt not in ("Telegram", "Fragment", "MarketApp"):
+    if mkt not in ("Telegram", "MarketApp"):
         return {"ok": False, "error": "marketplace"}
     # All marketplaces: user provides collection + num; bot auto-fetches the listing.
     # No links needed from the frontend.
@@ -3165,14 +3165,40 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
     log.error("promo createInvoiceLink failed: %s", resp)
     return {"ok": False, "error": "invoice"}
 
+_promo_verify_ts: dict = {}   # pid -> last_verified unix ts
+
+async def _bg_verify_promo(p: dict):
+    """Background: re-check a specific-num promo is still listed; mark sold if not."""
+    pid = p.get("id") or ""
+    if not pid:
+        return
+    fetch = await _promo_auto_fetch(
+        p.get("marketplace") or "", p.get("slug") or "",
+        p.get("gift_id") or "", p.get("num") or "",
+        p.get("collection") or "")
+    if not fetch:
+        _promo_set_status(pid, "sold")
+        log.info("promo %s marked sold: listing no longer found on %s", pid, p.get("marketplace"))
+
+
 @app.get("/api/promos")
 async def promos(gift_id: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Active promotions for a gift collection, to blend at the top of a scout.
-    Scout Pro members get none (their perk is an ad-free scout)."""
+    Scout Pro members get none (their perk is an ad-free scout).
+    Promos with specific gift numbers are background-verified every 5 min;
+    sold / de-listed gifts are automatically removed from display."""
     uid = verify_init_data(x_init_data)
     if uid and get_tier(uid) == "pro":
         return {"promos": []}
-    return {"promos": _promo_active_for(_digits(gift_id)), "redirect": MINIAPP_URL}
+    active = _promo_active_for(_digits(gift_id))
+    # Schedule background listing-check for number-specific promos (non-blocking)
+    now = time.time()
+    for p in active:
+        pid = p.get("id") or ""
+        if pid and p.get("num") and (now - _promo_verify_ts.get(pid, 0)) > 300:
+            _promo_verify_ts[pid] = now
+            asyncio.get_running_loop().create_task(_bg_verify_promo(p))
+    return {"promos": active, "redirect": MINIAPP_URL}
 
 @app.post("/api/promote/report")
 async def promote_report(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
