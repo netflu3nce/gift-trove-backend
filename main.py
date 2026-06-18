@@ -667,7 +667,7 @@ def _sub_row(uid):
 
 # A vanity code must look like a code, not impersonate a number that resolve_ref
 # would read as a raw uid, so we require at least one letter.
-_VANITY_RE = _re.compile(r"^[A-Z0-9]{3,12}$")
+_VANITY_RE = _re.compile(r"^[A-Z0-9]{5,12}$")
 
 def set_vanity(uid, code):
     """Premium perk: claim a custom referral code. Returns (ok, code_or_errorkey)."""
@@ -732,6 +732,111 @@ def _promo_activate(pid, uid, charge_id):
     except Exception as e:
         log.error("promo_activate failed: %s", e)
         return 0
+
+
+async def _promo_auto_fetch(marketplace, slug, gift_id, num, collection_name=""):
+    """Fetch real listing data for a specific gift (by num) from the given marketplace.
+    Returns dict {price, currency, model, symbol, backdrop, url} or {} on miss."""
+    num_int = int(num) if str(num or "").isdigit() else None
+
+    # ── Telegram (MTProto GetResale scan) ──────────────────────────────────────
+    if marketplace == "Telegram" and gift_id and num_int is not None:
+        GetResale = _payments("GetResaleStarGiftsRequest")
+        if client and GetResale:
+            try:
+                offset = ""
+                for _ in range(8):          # scan up to 8 × 100 = 800 listings
+                    res = await _invoke(lambda: GetResale(
+                        gift_id=int(gift_id), attributes_hash=0,
+                        sort_by_price=False, offset=offset, limit=100))
+                    gifts = getattr(res, "gifts", []) or []
+                    for g in gifts:
+                        item = serialize_unique(g)
+                        if item.get("num") == num_int:
+                            log.info("promo_auto_fetch Telegram found #%s", num_int)
+                            return {
+                                "price":    str(item.get("price", "")) if item.get("price") is not None else "",
+                                "currency": item.get("currency", "Stars"),
+                                "model":    item.get("model")    or "",
+                                "symbol":   item.get("symbol")   or "",
+                                "backdrop": item.get("backdrop") or "",
+                                "url":      item.get("url")      or f"https://t.me/nft/{slug}-{num}",
+                            }
+                    nxt = getattr(res, "next_offset", "") or ""
+                    if not nxt or not gifts:
+                        break
+                    offset = nxt
+                log.info("promo_auto_fetch Telegram #%s not found in listings", num_int)
+            except Exception as e:
+                log.info("promo_auto_fetch Telegram error: %s", e)
+        return {}
+
+    # ── Fragment (scraper — num captured per item) ─────────────────────────────
+    if marketplace == "Fragment" and slug:
+        try:
+            fslug = slug.lower()
+            listings = await fragment_search(fslug, collection_name or slug, limit=200)
+            for item in listings:
+                if item.get("num") == num_int:
+                    log.info("promo_auto_fetch Fragment found #%s", num_int)
+                    return {
+                        "price":    str(item.get("price", "")) if item.get("price") is not None else "",
+                        "currency": item.get("currency", "TON"),
+                        "model":    item.get("model")    or "",
+                        "symbol":   item.get("symbol")   or "",
+                        "backdrop": item.get("backdrop") or "",
+                        "url":      item.get("url")      or f"https://fragment.com/gift/{fslug}-{num}",
+                    }
+            log.info("promo_auto_fetch Fragment #%s not found", num_int)
+        except Exception as e:
+            log.info("promo_auto_fetch Fragment error: %s", e)
+        return {}
+
+    # ── MarketApp (item_num_from / item_num_to exact filter) ──────────────────
+    if marketplace == "MarketApp" and MARKETAPP_TOKEN and num_int is not None:
+        try:
+            coll_addr = await _marketapp_collection_address(collection_name, slug)
+            if not coll_addr:
+                log.info("promo_auto_fetch MarketApp: no address for %r", slug)
+                return {}
+            async with httpx.AsyncClient(timeout=12) as cli:
+                r = await cli.get(f"{MARKETAPP_BASE}/v1/gifts/onsale/",
+                                  params={"collection_address": coll_addr,
+                                          "item_num_from": num_int, "item_num_to": num_int},
+                                  headers={"Authorization": MARKETAPP_TOKEN})
+            if r.status_code == 200:
+                data = r.json()
+                items = (data.get("items") or []) if isinstance(data, dict) else []
+                if items:
+                    mapped = _marketapp_item(items[0], collection_name or slug, slug)
+                    if mapped:
+                        log.info("promo_auto_fetch MarketApp found #%s", num_int)
+                        return {
+                            "price":    str(mapped.get("price", "")) if mapped.get("price") is not None else "",
+                            "currency": mapped.get("currency", "GRAM"),
+                            "model":    mapped.get("model")    or "",
+                            "symbol":   mapped.get("symbol")   or "",
+                            "backdrop": mapped.get("backdrop") or "",
+                            "url":      mapped.get("url")      or "",
+                        }
+            log.info("promo_auto_fetch MarketApp #%s status=%s", num_int, r.status_code if 'r' in dir() else "?")
+        except Exception as e:
+            log.info("promo_auto_fetch MarketApp error: %s", e)
+        return {}
+
+    return {}
+
+
+def _promo_set_attrs(pid, model, symbol, backdrop, url):
+    """Update attribute + link fields on a promo after auto-fetch."""
+    try:
+        with db() as conn:
+            conn.execute(
+                "UPDATE promos SET model=?, symbol=?, backdrop=?, link=? WHERE id=?",
+                (model or "", symbol or "", backdrop or "", url or "", pid))
+            conn.commit()
+    except Exception as e:
+        log.error("promo_set_attrs failed: %s", e)
 
 def _promo_set_charge(pid, charge_id):
     try:
@@ -1303,39 +1408,33 @@ async def _record_payment(action):
         pid, uid = parts[1], parts[2]
         _promo_set_charge(pid, charge_id)
         promo = _promo_get(pid) or {}
-        if (promo.get("marketplace") or "") in ("Fragment", "MarketApp"):
-            # Manual review: a human checks the Fragment link before it goes live.
-            _promo_set_status(pid, "review")
-            log.info("promotion awaiting review: id=%s uid=%s", pid, uid)
-            try:
-                await bot.send_message(
-                    int(ALERT_ADMIN_ID),
-                    f"Fragment promotion to review\nGift: {promo.get('collection','?')}\nLink: {promo.get('link','-')}\nFrom uid: {uid}",
-                    buttons=[[Button.inline("Approve", f"papprove:{pid}".encode()),
-                              Button.inline("Decline + refund", f"pdecline:{pid}".encode())]],
-                    link_preview=False)
-            except Exception as e:
-                log.info("admin review DM failed: %s", e)
-            try:
-                await _bot_api("sendMessage", {"chat_id": int(uid),
-                    "text": "Your Fragment promotion was received and is being reviewed. It goes live once approved (usually quickly)."})
-            except Exception:
-                pass
-        else:
-            exp = _promo_activate(pid, uid, charge_id)
-            # Auto-source the live Telegram floor price so the card shows real value.
-            try:
-                amt, cur = await _promo_fetch_price(promo.get("gift_id"))
+        mkt  = promo.get("marketplace") or "Telegram"
+        num  = promo.get("num") or ""
+        slug = promo.get("slug") or ""
+        gift_id = promo.get("gift_id") or ""
+        coll_name = promo.get("collection") or ""
+        # Auto-fetch listing data: price, model, symbol, backdrop from the marketplace.
+        # No manual admin review — every marketplace is handled programmatically.
+        try:
+            fetch = await _promo_auto_fetch(mkt, slug, gift_id, num, coll_name)
+            if fetch:
+                _promo_set_price(pid, fetch.get("price", ""), fetch.get("currency", ""))
+                _promo_set_attrs(pid, fetch.get("model"), fetch.get("symbol"),
+                                 fetch.get("backdrop"), fetch.get("url"))
+            else:
+                log.info("promo_auto_fetch: no listing found, activating with floor price")
+                amt, cur = await _promo_fetch_price(gift_id)
                 if amt:
                     _promo_set_price(pid, amt, cur)
-            except Exception as e:
-                log.info("promo auto-price skipped: %s", e)
-            log.info("promotion active: id=%s uid=%s until=%s", pid, uid, exp)
-            try:
-                await _bot_api("sendMessage", {"chat_id": int(uid),
-                    "text": f"Your gift promotion is live for the next {PROMO_DAYS} days. It will appear at the top of matching scouts."})
-            except Exception:
-                pass
+        except Exception as e:
+            log.info("promo activation fetch error: %s", e)
+        exp = _promo_activate(pid, uid, charge_id)
+        log.info("promotion active: id=%s uid=%s mkt=%s num=%s until=%s", pid, uid, mkt, num, exp)
+        try:
+            await _bot_api("sendMessage", {"chat_id": int(uid),
+                "text": f"Your gift promotion is live for {PROMO_DAYS} days and will appear at the top of matching scouts."})
+        except Exception:
+            pass
     else:
         log.info("payment with unrecognized payload: %r", payload)
 
@@ -3036,26 +3135,17 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
     mkt = _clamp(payload.get("marketplace"), 20)
     if mkt not in ("Telegram", "Fragment", "MarketApp"):
         return {"ok": False, "error": "marketplace"}
-    plink = ""
-    if mkt in ("Fragment", "MarketApp"):
-        plink = _clamp(payload.get("link"), 256)
-        low = plink.lower()
-        if mkt == "Fragment":
-            valid = low.startswith("https://fragment.com/") or low.startswith("https://www.fragment.com/")
-        else:
-            valid = low.startswith("https://marketapp.ws/") or low.startswith("https://www.marketapp.ws/")
-        if not valid:
-            return {"ok": False, "error": "domain"}
-    # Telegram: bot auto-scouts the floor price — no link or manual amount needed.
+    # All marketplaces: user provides collection + num; bot auto-fetches the listing.
+    # No links needed from the frontend.
     fields = {
         "collection": name,
         "gift_id": gift_id,
         "slug": slug,
-        "num": _digits(payload.get("num")) if mkt == "Telegram" else "",
-        "model": "", "symbol": "", "backdrop": "",   # not requested in simplified Telegram flow
+        "num": _digits(payload.get("num")),
+        "model": "", "symbol": "", "backdrop": "",
         "marketplace": mkt,
         "amount": "", "currency": "",
-        "link": plink,
+        "link": "",
     }
     pid = _promo_create(uid, fields)
     if not pid:
