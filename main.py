@@ -1303,7 +1303,7 @@ async def _record_payment(action):
         pid, uid = parts[1], parts[2]
         _promo_set_charge(pid, charge_id)
         promo = _promo_get(pid) or {}
-        if (promo.get("marketplace") or "") == "Fragment":
+        if (promo.get("marketplace") or "") in ("Fragment", "MarketApp"):
             # Manual review: a human checks the Fragment link before it goes live.
             _promo_set_status(pid, "review")
             log.info("promotion awaiting review: id=%s uid=%s", pid, uid)
@@ -3034,28 +3034,27 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
     if not gift_id or not name:
         return {"ok": False, "error": "collection"}
     mkt = _clamp(payload.get("marketplace"), 20)
-    if mkt not in ("Telegram", "Fragment"):
+    if mkt not in ("Telegram", "Fragment", "MarketApp"):
         return {"ok": False, "error": "marketplace"}
     plink = ""
-    if mkt == "Fragment":
-        # Fragment listings are scraped, not API-verified, so a human approves the
-        # link first. Auto-decline anything that isn't a real fragment.com URL.
+    if mkt in ("Fragment", "MarketApp"):
         plink = _clamp(payload.get("link"), 256)
         low = plink.lower()
-        if not (low.startswith("https://fragment.com/") or low.startswith("https://www.fragment.com/")):
+        if mkt == "Fragment":
+            valid = low.startswith("https://fragment.com/") or low.startswith("https://www.fragment.com/")
+        else:
+            valid = low.startswith("https://marketapp.ws/") or low.startswith("https://www.marketapp.ws/")
+        if not valid:
             return {"ok": False, "error": "domain"}
-    # No amount / no free-form link for Telegram: the bot sources the price itself.
+    # Telegram: bot auto-scouts the floor price — no link or manual amount needed.
     fields = {
         "collection": name,
         "gift_id": gift_id,
         "slug": slug,
         "num": _digits(payload.get("num")) if mkt == "Telegram" else "",
-        "model": _clamp(payload.get("model"), 80),
-        "symbol": _clamp(payload.get("symbol"), 80),
-        "backdrop": _clamp(payload.get("backdrop"), 80),
+        "model": "", "symbol": "", "backdrop": "",   # not requested in simplified Telegram flow
         "marketplace": mkt,
-        "amount": "",
-        "currency": "",
+        "amount": "", "currency": "",
         "link": plink,
     }
     pid = _promo_create(uid, fields)
