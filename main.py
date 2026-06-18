@@ -50,8 +50,7 @@ GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 # endpoint can be corrected from their Swagger without a code change.
 MARKETAPP_TOKEN = os.getenv("MARKETAPP_TOKEN", "")
 MARKETAPP_BASE = os.getenv("MARKETAPP_BASE", "https://api.marketapp.ws").rstrip("/")
-MARKETAPP_LISTINGS_PATH = os.getenv("MARKETAPP_LISTINGS_PATH", "/api/v1/gifts/listings")
-MARKETAPP_COLLECTION_PARAM = os.getenv("MARKETAPP_COLLECTION_PARAM", "collection")
+MARKETAPP_LISTINGS_PATH = os.getenv("MARKETAPP_LISTINGS_PATH", "/api/search")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://gift-trove-frontend.vercel.app").split(",") if o.strip()]
 DB_PATH = os.getenv("DB_PATH", "gifttrove.db")
 # Durable storage: if DATABASE_URL (Postgres, e.g. Neon) is set, use it so data
@@ -1995,13 +1994,20 @@ async def marketapp_search(slug, gift_name, gift_id=None, limit=40):
     if hit and now - hit[0] < 60:
         return hit[1][:limit]
     url = f"{MARKETAPP_BASE}{MARKETAPP_LISTINGS_PATH}"
-    params = {MARKETAPP_COLLECTION_PARAM: slug or "", "limit": limit, "sort": "price_asc"}
+    # MarketApp /api/search mirrors the gift-scout param shape:
+    # gift (display name), gift_id, slug, sort (default/price_asc/price_desc), limit.
+    ma_sort = "price_asc"  # always fetch cheapest-first; we re-sort client-side
+    params = {"slug": slug or "", "sort": ma_sort, "limit": limit}
+    if gift_name:
+        params["gift"] = gift_name
     if gift_id:
         params["gift_id"] = str(gift_id)
     try:
         async with httpx.AsyncClient(timeout=10) as cli:
-            r = await cli.get(url, params=params, headers={"Authorization": MARKETAPP_TOKEN, "Accept": "application/json"})
-        log.info("marketapp %s status=%s sample=%s", url, r.status_code, (r.text or "")[:400].replace("\n", " "))
+            r = await cli.get(url, params=params,
+                              headers={"Authorization": MARKETAPP_TOKEN, "Accept": "application/json"})
+        log.info("marketapp %s status=%s sample=%s", url, r.status_code,
+                 (r.text or "")[:400].replace("\n", " "))
         if r.status_code != 200:
             return []
         data = r.json()
