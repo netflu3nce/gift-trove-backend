@@ -50,7 +50,6 @@ GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 # endpoint can be corrected from their Swagger without a code change.
 MARKETAPP_TOKEN = os.getenv("MARKETAPP_TOKEN", "")
 MARKETAPP_BASE = os.getenv("MARKETAPP_BASE", "https://api.marketapp.ws").rstrip("/")
-MARKETAPP_LISTINGS_PATH = os.getenv("MARKETAPP_LISTINGS_PATH", "/api/search")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://gift-trove-frontend.vercel.app").split(",") if o.strip()]
 DB_PATH = os.getenv("DB_PATH", "gifttrove.db")
 # Durable storage: if DATABASE_URL (Postgres, e.g. Neon) is set, use it so data
@@ -1920,90 +1919,112 @@ async def fragment_search(tg_slug, gift_name, limit=24):
 
 
 # ─── MarketApp aggregator (Tonnel / Portals / Fragment / GetGems / MarketApp) ──
-# Read-only listings merged into a scout. Auth is a raw token in the Authorization
-# header. Endpoint path + collection param are env-overridable; the first response
-# is logged (sampled) so the exact field shape can be confirmed and the mapper
-# below finalized. Always returns [] on any error so it can never break a scout.
-_marketapp_cache = {}
+# Endpoints (from their OpenAPI spec at api.marketapp.ws/docs/openapi.json):
+#   GET /v1/collections/gifts/           → [{name, address, extra_data}]  (name→TON addr map)
+#   GET /v1/gifts/onsale/                → {cursor, items:[NFTItem]}
+#
+# NFTItem fields:
+#   address, name, collection_address, owner, real_owner,
+#   min_bid (nanotons string), max_bid, currency ("TON"|"USDT"),
+#   attributes [{trait_type, value}], item_num, listed_at, is_restricted
+#
+# Auth: Authorization: <raw_token>   (no "Bearer" prefix)
+_marketapp_cache = {}          # key → (ts, [items])
+_marketapp_colls_cache = {}    # {"ts": float, "data": [...]}
 
-def _ma_get(d, *keys, default=None):
-    if not isinstance(d, dict):
-        return default
-    for k in keys:
-        v = d.get(k)
-        if v not in (None, ""):
-            return v
-    return default
+async def _marketapp_collection_address(gift_name, slug):
+    """Resolve a gift name/slug to a MarketApp TON collection address.
+    Fetched once per hour; names match case-insensitively."""
+    global _marketapp_colls_cache
+    now = time.time()
+    if not _marketapp_colls_cache or now - _marketapp_colls_cache.get("ts", 0) > 3600:
+        try:
+            async with httpx.AsyncClient(timeout=10) as cli:
+                r = await cli.get(f"{MARKETAPP_BASE}/v1/collections/gifts/",
+                                  headers={"Authorization": MARKETAPP_TOKEN})
+            if r.status_code == 200:
+                data = r.json()
+                _marketapp_colls_cache = {"ts": now, "data": data if isinstance(data, list) else []}
+                log.info("marketapp: cached %d gift collections", len(_marketapp_colls_cache["data"]))
+            else:
+                log.info("marketapp collections fetch: status %s", r.status_code)
+        except Exception as e:
+            log.info("marketapp collections fetch failed: %s", e)
+    colls = _marketapp_colls_cache.get("data", [])
+    if not colls:
+        return None
+    gname = (gift_name or "").lower().strip()
+    gslug = (slug or "").lower()
+    for c in colls:
+        cname = (c.get("name") or "").lower().strip()
+        if cname == gname or cname.replace(" ", "") == gslug or cname.replace(" ", "") == gname.replace(" ", ""):
+            return c.get("address")
+    return None
 
 def _marketapp_item(raw, gift_name, fallback_slug):
     if not isinstance(raw, dict):
         return None
-    slug = _ma_get(raw, "slug", "collection_slug", "collection", default=fallback_slug) or fallback_slug
-    num = _ma_get(raw, "num", "number", "index", "gift_num", "external_id")
+    num = raw.get("item_num")
     try:
         num = int(num) if num is not None else None
     except Exception:
         num = None
-    price = _ma_get(raw, "price", "amount", "floor", "ton_price")
+    # min_bid is nanotons (string) → divide by 1e9 for TON/GRAM value
     try:
-        price = float(price) if price is not None else None
+        price = float(raw.get("min_bid") or 0) / 1e9
+        if price <= 0:
+            price = None
     except Exception:
         price = None
-    currency = str(_ma_get(raw, "currency", "asset", "token", default="TON") or "TON")
-    cl = currency.lower()
-    if cl in ("ton", "gram", "toncoin", "nanoton", ""):
-        currency, gram_value = "GRAM", price
-    elif cl.startswith("star") or cl == "xtr":
-        currency = "Stars"
-        gram_value = (price / STARS_PER_TON) if (price is not None and STARS_PER_TON) else None
+    currency_raw = str(raw.get("currency") or "TON").upper()
+    if currency_raw == "USDT":
+        currency, gram_value = "USDT", None
     else:
-        gram_value = price
-    attrs = _ma_get(raw, "attributes", "traits", default={})
-    def _attr(*names):
-        if isinstance(attrs, dict):
-            for k, v in attrs.items():
-                if str(k).lower() in names:
-                    return v
-        elif isinstance(attrs, list):
-            for it in attrs:
-                if str(_ma_get(it, "trait_type", "type", "name", default="")).lower() in names:
-                    return _ma_get(it, "value", "name")
-        return _ma_get(raw, *names)
-    source = str(_ma_get(raw, "source", "marketplace", "market", default="MarketApp") or "MarketApp")
-    url = _ma_get(raw, "url", "link", "listing_url")
-    if not url and slug and num is not None:
-        url = f"https://t.me/nft/{slug}-{num}"
+        currency, gram_value = "GRAM", price   # TON == GRAM (rebrand)
+    # Attribute extraction from [{trait_type, value}]
+    attrs = raw.get("attributes") or []
+    def _attr(*types):
+        for a in attrs:
+            if str(a.get("trait_type") or "").lower() in types:
+                v = a.get("value")
+                return str(v) if v is not None else None
+        return None
+    nft_address = raw.get("address") or ""
+    slug = fallback_slug  # not in response; use the one we looked up with
+    url = (f"https://t.me/nft/{slug}-{num}" if slug and num is not None
+           else f"https://marketapp.ws/nft/{nft_address}/" if nft_address else None)
     return {
-        "id": str(_ma_get(raw, "id", "listing_id", default=f"ma-{slug}-{num}")),
-        "name": gift_name or _ma_get(raw, "name", "title", "collection_name", default=slug),
+        "id": nft_address or f"ma-{slug}-{num}",
+        "name": raw.get("name") or gift_name,
         "slug": slug, "num": num,
         "price": price, "currency": currency, "gram_value": gram_value,
-        "model": _attr("model") or "", "symbol": _attr("symbol", "pattern") or "",
+        "model":   _attr("model") or "",
+        "symbol":  _attr("symbol", "pattern") or "",
         "backdrop": _attr("backdrop", "background") or "",
-        "market": source[:1].upper() + source[1:] if source.islower() else source,
-        "url": url, "image": _ma_get(raw, "image", "photo", "preview", "thumb"),
-        "animation": None,
+        "market": "MarketApp",
+        "url": url, "image": None, "animation": None,
     }
 
-async def marketapp_search(slug, gift_name, gift_id=None, limit=40):
-    if not (MARKETAPP_TOKEN and HTTPX_OK and (slug or gift_id)):
+async def marketapp_search(slug, gift_name, gift_id=None, limit=40,
+                            model="", symbol="", backdrop=""):
+    if not (MARKETAPP_TOKEN and HTTPX_OK and (slug or gift_name)):
         return []
-    key = f"{slug}|{gift_id}"
+    key = f"{slug}|{gift_id}|{model}|{symbol}|{backdrop}"
     now = time.time()
     hit = _marketapp_cache.get(key)
     if hit and now - hit[0] < 60:
         return hit[1][:limit]
-    url = f"{MARKETAPP_BASE}{MARKETAPP_LISTINGS_PATH}"
-    # MarketApp /api/search mirrors the gift-scout param shape:
-    # gift (display name), gift_id, slug, sort (default/price_asc/price_desc), limit.
-    ma_sort = "price_asc"  # always fetch cheapest-first; we re-sort client-side
-    params = {"slug": slug or "", "sort": ma_sort, "limit": limit}
-    if gift_name:
-        params["gift"] = gift_name
-    if gift_id:
-        params["gift_id"] = str(gift_id)
+    coll_addr = await _marketapp_collection_address(gift_name, slug)
+    if not coll_addr:
+        log.info("marketapp: no collection address for %r / %r", gift_name, slug)
+        return []
+    url = f"{MARKETAPP_BASE}/v1/gifts/onsale/"
+    params = {"collection_address": coll_addr, "sort_by": "min_bid_asc"}
+    if model:    params["model"]   = model
+    if symbol:   params["symbol"]  = symbol
+    if backdrop: params["backdrop"] = backdrop
     try:
-        async with httpx.AsyncClient(timeout=10) as cli:
+        async with httpx.AsyncClient(timeout=12) as cli:
             r = await cli.get(url, params=params,
                               headers={"Authorization": MARKETAPP_TOKEN, "Accept": "application/json"})
         log.info("marketapp %s status=%s sample=%s", url, r.status_code,
@@ -2011,11 +2032,10 @@ async def marketapp_search(slug, gift_name, gift_id=None, limit=40):
         if r.status_code != 200:
             return []
         data = r.json()
-        rows = data if isinstance(data, list) else (
-            data.get("listings") or data.get("results") or data.get("items") or data.get("data") or [])
+        rows = (data.get("items") or []) if isinstance(data, dict) else []
         out = [it for raw in rows for it in [_marketapp_item(raw, gift_name, slug)] if it]
         _marketapp_cache[key] = (now, out)
-        if len(_marketapp_cache) > 200:
+        if len(_marketapp_cache) > 300:
             _marketapp_cache.pop(next(iter(_marketapp_cache)))
         return out[:limit]
     except Exception as e:
@@ -2638,9 +2658,12 @@ async def search(
 
     # MarketApp aggregator (Tonnel / Portals / Fragment / GetGems / MarketApp).
     # Dormant unless MARKETAPP_TOKEN is set; never raises into the scout.
-    if MARKETAPP_TOKEN and (slug or gift_id) and (not want or "MarketApp" in want):
+    # Passes attribute filters natively so results are precise.
+    if MARKETAPP_TOKEN and (slug or gift) and (not want or "MarketApp" in want):
         try:
-            results.extend(await marketapp_search(slug, gift, gift_id=gift_id, limit=40))
+            results.extend(await marketapp_search(
+                slug, gift, gift_id=gift_id, limit=40,
+                model=model, symbol=symbol, backdrop=backdrop))
         except Exception as e:
             log.info("marketapp dispatch skipped: %s", e)
 
