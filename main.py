@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gifttrove")
 
 try:
-    from telethon import TelegramClient, functions, types  # noqa: F401
+    from telethon import TelegramClient, functions, types, Button  # noqa: F401
     from telethon.sessions import StringSession
     try:
         from telethon.errors import FloodWaitError
@@ -338,6 +338,7 @@ def init_db():
                    collection TEXT NOT NULL,
                    gift_id TEXT,
                    slug TEXT,
+                   num TEXT,
                    model TEXT,
                    symbol TEXT,
                    backdrop TEXT,
@@ -355,7 +356,7 @@ def init_db():
         # Backfill columns on DBs created before they existed. We check first so we
         # never issue a duplicate ALTER (which on Postgres aborts the whole transaction).
         _have = _existing_columns(conn, "promos")
-        for _col, _typ in (("amount", "TEXT"), ("currency", "TEXT"), ("link", "TEXT")):
+        for _col, _typ in (("amount", "TEXT"), ("currency", "TEXT"), ("link", "TEXT"), ("num", "TEXT")):
             if _col not in _have:
                 conn.execute(f"ALTER TABLE promos ADD COLUMN {_col} {_typ}")
         # Affiliate earnings ledger (Scout Pro only). One row per credited payment.
@@ -700,11 +701,11 @@ def _promo_create(uid, fields):
     try:
         with db() as conn:
             conn.execute(
-                """INSERT INTO promos(id, uid, collection, gift_id, slug, model, symbol,
+                """INSERT INTO promos(id, uid, collection, gift_id, slug, num, model, symbol,
                        backdrop, marketplace, amount, currency, link, charge_id, status, reports, ts, expires_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (pid, str(uid), fields["collection"], fields.get("gift_id", ""), fields.get("slug", ""),
-                 fields.get("model", ""), fields.get("symbol", ""), fields.get("backdrop", ""),
+                 fields.get("num", ""), fields.get("model", ""), fields.get("symbol", ""), fields.get("backdrop", ""),
                  fields.get("marketplace", ""), fields.get("amount", ""), fields.get("currency", ""),
                  fields.get("link", ""), "", "pending", 0, int(time.time()), 0))
             conn.commit()
@@ -784,7 +785,7 @@ def _promo_active_for(gift_id):
     try:
         with db() as conn:
             rows = conn.execute(
-                """SELECT id, collection, gift_id, slug, model, symbol, backdrop, marketplace,
+                """SELECT id, collection, gift_id, slug, num, model, symbol, backdrop, marketplace,
                           amount, currency, link
                    FROM promos WHERE gift_id=? AND status='active' AND expires_at>? AND reports<?
                    ORDER BY ts ASC LIMIT ?""",
@@ -807,7 +808,7 @@ def _promo_get(pid):
     try:
         with db() as conn:
             row = conn.execute(
-                """SELECT id, uid, charge_id, status, marketplace, link, slug, collection,
+                """SELECT id, uid, charge_id, status, marketplace, link, slug, num, collection,
                           model, symbol, backdrop, gift_id FROM promos WHERE id=?""", (pid,)).fetchone()
         return dict(row) if row else None
     except Exception:
@@ -2863,6 +2864,7 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
         "collection": name,
         "gift_id": gift_id,
         "slug": slug,
+        "num": _digits(payload.get("num")) if mkt == "Telegram" else "",
         "model": _clamp(payload.get("model"), 80),
         "symbol": _clamp(payload.get("symbol"), 80),
         "backdrop": _clamp(payload.get("backdrop"), 80),
