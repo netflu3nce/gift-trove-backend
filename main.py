@@ -2026,9 +2026,15 @@ def _marketapp_item(raw, gift_name, fallback_slug):
                 return str(v) if v is not None else None
         return None
     nft_address = raw.get("address") or ""
+    coll_address = raw.get("collection_address") or ""
     slug = fallback_slug  # not in response; use the one we looked up with
-    url = (f"https://t.me/nft/{slug}-{num}" if slug and num is not None
-           else f"https://marketapp.ws/nft/{nft_address}/" if nft_address else None)
+    # Always link to MarketApp so the user buys there (they came from MarketApp chip).
+    if nft_address:
+        url = f"https://marketapp.ws/nft/{nft_address}/"
+    elif coll_address:
+        url = f"https://marketapp.ws/collection/{coll_address}/"
+    else:
+        url = "https://marketapp.ws/gifts/"
     return {
         "id": nft_address or f"ma-{slug}-{num}",
         "name": raw.get("name") or gift_name,
