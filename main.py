@@ -1431,8 +1431,22 @@ async def _record_payment(action):
         exp = _promo_activate(pid, uid, charge_id)
         log.info("promotion active: id=%s uid=%s mkt=%s num=%s until=%s", pid, uid, mkt, num, exp)
         try:
-            await _bot_api("sendMessage", {"chat_id": int(uid),
-                "text": f"Your gift promotion is live for {PROMO_DAYS} days and will appear at the top of matching scouts."})
+            gift_url = (f"https://t.me/nft/{slug}-{num}" if slug and num else
+                        f"https://marketapp.ws/" if mkt == "MarketApp" else "")
+            if fetch:
+                # Listing found — give them a confirmation with the link.
+                gift_url = fetch.get("url") or gift_url
+                await _bot_api("sendMessage", {"chat_id": int(uid),
+                    "text": (f"Your gift promotion is live for {PROMO_DAYS} days and will appear at the top of matching scouts.\n"
+                             f"Gift: {coll_name}{(' #' + str(num)) if num else ''}"
+                             f"{chr(10) + gift_url if gift_url else ''}")})
+            else:
+                # Listing not found — notify the user; promo is active but invisible until listed.
+                await _bot_api("sendMessage", {"chat_id": int(uid),
+                    "text": (f"Your promotion is active for {PROMO_DAYS} days, but GiftTrove couldn't find "
+                             f"{coll_name}{(' #' + str(num)) if num else ''} currently listed on {mkt}. "
+                             f"It will appear in scout results as soon as it goes on sale. "
+                             f"If it never goes live, the promotion slot will expire unused.")})
         except Exception:
             pass
     else:
@@ -1547,6 +1561,7 @@ async def background_telethon_initializer():
             asyncio.create_task(collections())
         except Exception as e:
             log.info("collections pre-warm skipped: %s", e)
+        asyncio.create_task(_bg_expire_promos())
 
     # 2c) Reports: deploy-live good news + the daily digest loop.
     try:
@@ -3179,6 +3194,64 @@ async def _bg_verify_promo(p: dict):
     if not fetch:
         _promo_set_status(pid, "sold")
         log.info("promo %s marked sold: listing no longer found on %s", pid, p.get("marketplace"))
+        # Notify the promoter that their gift was sold / de-listed.
+        uid = p.get("uid") or ""
+        slug = p.get("slug") or ""
+        num = p.get("num") or ""
+        mkt = p.get("marketplace") or "Telegram"
+        coll = p.get("collection") or "your gift"
+        gift_url = p.get("link") or (f"https://t.me/nft/{slug}-{num}" if slug and num else "")
+        if uid:
+            try:
+                await _bot_api("sendMessage", {"chat_id": int(uid),
+                    "text": (f"Your promoted gift {coll}{(' #' + str(num)) if num else ''} "
+                             f"is no longer listed for sale on {mkt}, so it has been removed from scout results. "
+                             f"Your promotion slot remains active until it expires. "
+                             f"{gift_url if gift_url else ''}")})
+            except Exception as e:
+                log.info("sold notify DM failed: %s", e)
+
+
+async def _bg_expire_promos():
+    """Periodic background task: notify promoters when their promo has just expired."""
+    while True:
+        try:
+            await asyncio.sleep(3600)   # check every hour
+            now = int(time.time())
+            window = now - 3660         # up to ~61 min ago (catches last hour's expiries)
+            try:
+                with db() as conn:
+                    rows = conn.execute(
+                        "SELECT id, uid, collection, num, slug, marketplace, link FROM promos "
+                        "WHERE status='active' AND expires_at<=? AND expires_at>=?",
+                        (now, window)).fetchall()
+            except Exception:
+                rows = []
+            for r in rows:
+                pid = r["id"] or ""
+                if not pid:
+                    continue
+                _promo_set_status(pid, "expired")
+                uid = r["uid"] or ""
+                coll = r["collection"] or "your gift"
+                num = r["num"] or ""
+                slug = r["slug"] or ""
+                mkt = r["marketplace"] or "Telegram"
+                gift_url = r["link"] or (f"https://t.me/nft/{slug}-{num}" if slug and num else "")
+                if uid:
+                    try:
+                        await _bot_api("sendMessage", {"chat_id": int(uid),
+                            "text": (f"Your promotion for {coll}{(' #' + str(num)) if num else ''} "
+                                     f"has ended after {PROMO_DAYS} days. "
+                                     f"It is no longer shown at the top of scout results. "
+                                     f"You can promote it again anytime from the GiftTrove profile tab."
+                                     f"{chr(10) + gift_url if gift_url else ''}")})
+                    except Exception as e:
+                        log.info("expiry notify DM failed: %s", e)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.info("_bg_expire_promos error: %s", e)
 
 
 @app.get("/api/promos")
