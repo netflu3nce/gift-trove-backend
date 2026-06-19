@@ -808,7 +808,7 @@ async def _promo_auto_fetch(marketplace, slug, gift_id, num, collection_name="")
                 data = r.json()
                 items = (data.get("items") or []) if isinstance(data, dict) else []
                 if items:
-                    mapped = _marketapp_item(items[0], collection_name or slug, slug)
+                    mapped = _marketapp_item(items[0], collection_name or slug, slug, gift_id)
                     if mapped:
                         log.info("promo_auto_fetch MarketApp found #%s", num_int)
                         return {
@@ -2111,7 +2111,28 @@ async def _marketapp_collection_address(gift_name, slug):
 
     return None
 
-def _marketapp_item(raw, gift_name, fallback_slug):
+def _backdrop_hex_lookup(gift_id, backdrop_name):
+    """Resolve a backdrop colour hex by name, reusing whatever attribute data
+    is already cached for this gift_id (from /api/attributes) — no network call.
+    Used to give Fragment/MarketApp listings the same colour dot as Telegram ones,
+    since they share the same official backdrop names."""
+    if not gift_id or not backdrop_name:
+        return None
+    gift_id = _digits(gift_id)
+    payload = cache_get(f"attrs:{gift_id}")
+    if not (payload and isinstance(payload, dict)):
+        db_payload, _ts = _attrs_db_get(gift_id)
+        payload = (db_payload or {}).get("resp") if isinstance(db_payload, dict) else None
+    if not (payload and isinstance(payload, dict)):
+        return None
+    name_l = backdrop_name.strip().lower()
+    for b in payload.get("backdrops") or []:
+        if str(b.get("name") or "").strip().lower() == name_l:
+            return b.get("hex")
+    return None
+
+
+def _marketapp_item(raw, gift_name, fallback_slug, gift_id=None):
     if not isinstance(raw, dict):
         return None
     num = raw.get("item_num")
@@ -2149,6 +2170,7 @@ def _marketapp_item(raw, gift_name, fallback_slug):
         url = f"https://marketapp.ws/collection/{coll_address}/"
     else:
         url = "https://marketapp.ws/gifts/"
+    backdrop_name = _attr("backdrop", "background") or ""
     return {
         "id": nft_address or f"ma-{slug}-{num}",
         "name": raw.get("name") or gift_name,
@@ -2156,7 +2178,8 @@ def _marketapp_item(raw, gift_name, fallback_slug):
         "price": price, "currency": currency, "gram_value": gram_value,
         "model":   _attr("model") or "",
         "symbol":  _attr("symbol", "pattern") or "",
-        "backdrop": _attr("backdrop", "background") or "",
+        "backdrop": backdrop_name,
+        "backdropHex": _backdrop_hex_lookup(gift_id, backdrop_name),
         "market": "MarketApp",
         "url": url, "image": None, "animation": None,
     }
@@ -2189,7 +2212,7 @@ async def marketapp_search(slug, gift_name, gift_id=None, limit=40,
             return []
         data = r.json()
         rows = (data.get("items") or []) if isinstance(data, dict) else []
-        out = [it for raw in rows for it in [_marketapp_item(raw, gift_name, slug)] if it]
+        out = [it for raw in rows for it in [_marketapp_item(raw, gift_name, slug, gift_id)] if it]
         _marketapp_cache[key] = (now, out)
         if len(_marketapp_cache) > 300:
             _marketapp_cache.pop(next(iter(_marketapp_cache)))
@@ -2859,6 +2882,12 @@ async def search(
         results.sort(key=lambda r: (_gram_value(r) is None,
                                     -(_gram_value(r) or 0) if rev else (_gram_value(r) or 0)))
 
+    # Stamp the collection's gift_id onto every result so the client can persist it
+    # (e.g. when saving a gift) and later ask /api/check_listings whether it's sold.
+    if gift_id:
+        for r in results:
+            r["gift_id"] = gift_id
+
     return {"results": results, "next_offset": next_offset, "count": len(results)}
 
 
@@ -3272,6 +3301,58 @@ async def promos(gift_id: str = Query(""), x_init_data: str = Header(default="",
             _promo_verify_ts[pid] = now
             asyncio.get_running_loop().create_task(_bg_verify_promo(p))
     return {"promos": active, "redirect": MINIAPP_URL}
+
+@app.post("/api/check_listings")
+async def check_listings(payload: dict = Body(...)):
+    """Batch-check whether saved gifts are still listed for sale on their
+    marketplace. Used by the Saved tab to show SOLD instead of Buy.
+    Body: {items: [{id, gift_id, slug, num, marketplace, name}, ...]}
+    Returns: {sold: [id, id, ...]}  (only the ones no longer listed)
+    Limited to 30 items per call and a short per-item timeout so a large
+    saved list never stalls the Saved tab."""
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return {"sold": []}
+    items = items[:30]
+    sold_ids = []
+
+    async def _check(it):
+        if not isinstance(it, dict):
+            return
+        iid = _clamp(it.get("id"), 128)
+        num = _digits(it.get("num"))
+        mkt = it.get("marketplace") or it.get("market") or ""
+        if not (iid and num and mkt in ("Telegram", "Fragment", "MarketApp")):
+            return   # can't verify without a specific gift number; assume still valid
+        raw_slug = str(it.get("slug") or "")
+        # item.slug from search results is "{collectionSlug}-{num}" (see cdn_full());
+        # strip that suffix to recover the bare collection slug Fragment/MarketApp need.
+        suffix = f"-{num}"
+        bare_slug = raw_slug[: -len(suffix)] if raw_slug.lower().endswith(suffix.lower()) else raw_slug
+        slug = _safe_slug(bare_slug)
+        gift_id = _digits(it.get("gift_id"))
+        name = _clamp(it.get("name") or it.get("collection") or "", 64)
+        # Guard against false positives: only verify when we actually have what
+        # that marketplace's lookup needs. Older saved items (saved before this
+        # check existed) may be missing gift_id/slug — skip rather than risk
+        # wrongly flagging a still-live gift as sold.
+        if mkt == "Telegram" and not gift_id:
+            return
+        if mkt == "Fragment" and not slug:
+            return
+        if mkt == "MarketApp" and not (slug or name):
+            return
+        try:
+            fetch = await asyncio.wait_for(
+                _promo_auto_fetch(mkt, slug, gift_id, num, name), timeout=10)
+        except Exception:
+            return   # network hiccup — don't falsely mark sold
+        if not fetch:
+            sold_ids.append(iid)
+
+    await asyncio.gather(*[_check(it) for it in items], return_exceptions=True)
+    return {"sold": sold_ids}
+
 
 @app.post("/api/promote/report")
 async def promote_report(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
