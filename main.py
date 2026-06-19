@@ -818,6 +818,21 @@ async def _promo_auto_fetch(marketplace, slug, gift_id, num, collection_name="")
     return {}
 
 
+# Telegram lookups (GetUniqueStarGiftRequest) share ONE MTProto connection —
+# Telethon serializes RPCs on it, so firing many at once doesn't actually run
+# them in parallel, it just queues them and starves every other feature
+# (Results, Scout, anything else using `client`) for however long the queue
+# takes to drain. Every caller that does a Telegram listing check (saved-gift
+# verification, promo background verification) shares this cap so they can
+# never compound into a multi-second connection traffic jam together.
+_telegram_check_sema = asyncio.Semaphore(2)
+# Cache listing-check results briefly so re-opening the Saved tab or a promo's
+# 5-min re-verify cycle doesn't redundantly re-hit Telegram/Fragment/MarketApp
+# for a gift that was just confirmed seconds ago.
+_listing_check_cache: dict = {}   # "{mkt}:{slug}:{num}" -> (unix_ts, sold_bool)
+_LISTING_CHECK_TTL = 1200         # 20 min
+
+
 def _promo_set_attrs(pid, model, symbol, backdrop, url):
     """Update attribute + link fields on a promo after auto-fetch."""
     try:
@@ -3211,18 +3226,34 @@ async def _bg_verify_promo(p: dict):
     """Background: re-check a specific-num promo is still listed; mark sold if not.
     A lookup error (network hiccup, marketplace API hiccup, etc.) is NOT treated
     as "sold" — only a confirmed, successful lookup that finds nothing does that.
-    Otherwise a brief outage could wrongly mark a perfectly live gift as sold."""
+    Otherwise a brief outage could wrongly mark a perfectly live gift as sold.
+    Shares the Telegram concurrency cap and the listing-check cache with
+    /api/check_listings so the two never compound into a connection traffic jam."""
     pid = p.get("id") or ""
     if not pid:
         return
-    try:
-        fetch = await _promo_auto_fetch(
-            p.get("marketplace") or "", p.get("slug") or "",
-            p.get("gift_id") or "", p.get("num") or "",
-            p.get("collection") or "")
-    except Exception as e:
-        log.info("promo %s verify skipped (inconclusive): %s", pid, e)
-        return
+    mkt = p.get("marketplace") or ""
+    slug = p.get("slug") or ""
+    num = p.get("num") or ""
+    cache_key = f"{mkt}:{slug}:{num}" if (mkt and slug and num) else ""
+    now = time.time()
+    cached = _listing_check_cache.get(cache_key) if cache_key else None
+    if cached and (now - cached[0]) < _LISTING_CHECK_TTL:
+        fetch = {} if cached[1] else {"_cached_live": True}
+    else:
+        try:
+            if mkt == "Telegram":
+                async with _telegram_check_sema:
+                    fetch = await _promo_auto_fetch(
+                        mkt, slug, p.get("gift_id") or "", num, p.get("collection") or "")
+            else:
+                fetch = await _promo_auto_fetch(
+                    mkt, slug, p.get("gift_id") or "", num, p.get("collection") or "")
+        except Exception as e:
+            log.info("promo %s verify skipped (inconclusive): %s", pid, e)
+            return
+        if cache_key:
+            _listing_check_cache[cache_key] = (now, not fetch)
     if not fetch:
         _promo_set_status(pid, "sold")
         log.info("promo %s marked sold: listing no longer found on %s", pid, p.get("marketplace"))
@@ -3311,13 +3342,16 @@ async def check_listings(payload: dict = Body(...)):
     marketplace. Used by the Saved tab to show SOLD instead of Buy.
     Body: {items: [{id, gift_id, slug, num, marketplace, name}, ...]}
     Returns: {sold: [id, id, ...]}  (only the ones no longer listed)
-    Limited to 30 items per call and a short per-item timeout so a large
-    saved list never stalls the Saved tab."""
+    Results are cached for 20 minutes per gift, and Telegram lookups (the only
+    marketplace sharing the app's single MTProto connection) are concurrency-
+    capped, so this can never tie up the connection the way an unbounded burst
+    of direct lookups would."""
     items = payload.get("items")
     if not isinstance(items, list):
         return {"sold": []}
-    items = items[:30]
+    items = items[:20]
     sold_ids = []
+    now = time.time()
 
     async def _check(it):
         if not isinstance(it, dict):
@@ -3345,12 +3379,28 @@ async def check_listings(payload: dict = Body(...)):
             return
         if mkt == "MarketApp" and not (slug or name):
             return
+
+        cache_key = f"{mkt}:{slug}:{num}"
+        cached = _listing_check_cache.get(cache_key)
+        if cached and (now - cached[0]) < _LISTING_CHECK_TTL:
+            if cached[1]:
+                sold_ids.append(iid)
+            return
+
         try:
-            fetch = await asyncio.wait_for(
-                _promo_auto_fetch(mkt, slug, gift_id, num, name), timeout=10)
+            if mkt == "Telegram":
+                async with _telegram_check_sema:
+                    fetch = await asyncio.wait_for(
+                        _promo_auto_fetch(mkt, slug, gift_id, num, name), timeout=10)
+            else:
+                fetch = await asyncio.wait_for(
+                    _promo_auto_fetch(mkt, slug, gift_id, num, name), timeout=10)
         except Exception:
-            return   # network hiccup — don't falsely mark sold
-        if not fetch:
+            return   # network hiccup — don't falsely mark sold, don't cache either
+
+        is_sold = not fetch
+        _listing_check_cache[cache_key] = (now, is_sold)
+        if is_sold:
             sold_ids.append(iid)
 
     await asyncio.gather(*[_check(it) for it in items], return_exceptions=True)
