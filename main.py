@@ -736,92 +736,83 @@ def _promo_activate(pid, uid, charge_id):
 
 async def _promo_auto_fetch(marketplace, slug, gift_id, num, collection_name=""):
     """Fetch real listing data for a specific gift (by num) from the given marketplace.
-    Returns dict {price, currency, model, symbol, backdrop, url} or {} on miss."""
+    Returns dict {price, currency, model, symbol, backdrop, url} when found, or {}
+    when the lookup genuinely succeeded but the gift isn't listed.
+    Raises on network/API errors — callers that use a {} result to mean "sold" or
+    "not listed" should catch exceptions separately and treat them as inconclusive
+    (don't mark anything sold), since a transient error is not the same as a
+    confirmed miss."""
     num_int = int(num) if str(num or "").isdigit() else None
 
-    # ── Telegram (MTProto GetResale scan) ──────────────────────────────────────
-    if marketplace == "Telegram" and gift_id and num_int is not None:
-        GetResale = _payments("GetResaleStarGiftsRequest")
-        if client and GetResale:
-            try:
-                offset = ""
-                for _ in range(8):          # scan up to 8 × 100 = 800 listings
-                    res = await _invoke(lambda: GetResale(
-                        gift_id=int(gift_id), attributes_hash=0,
-                        sort_by_price=False, offset=offset, limit=100))
-                    gifts = getattr(res, "gifts", []) or []
-                    for g in gifts:
-                        item = serialize_unique(g)
-                        if item.get("num") == num_int:
-                            log.info("promo_auto_fetch Telegram found #%s", num_int)
-                            return {
-                                "price":    str(item.get("price", "")) if item.get("price") is not None else "",
-                                "currency": item.get("currency", "Stars"),
-                                "model":    item.get("model")    or "",
-                                "symbol":   item.get("symbol")   or "",
-                                "backdrop": item.get("backdrop") or "",
-                                "url":      item.get("url")      or f"https://t.me/nft/{slug}-{num}",
-                            }
-                    nxt = getattr(res, "next_offset", "") or ""
-                    if not nxt or not gifts:
-                        break
-                    offset = nxt
-                log.info("promo_auto_fetch Telegram #%s not found in listings", num_int)
-            except Exception as e:
-                log.info("promo_auto_fetch Telegram error: %s", e)
+    # ── Telegram (direct unique-gift lookup — reliable regardless of collection
+    # size, unlike scanning paginated resale listings which can miss items in
+    # large collections) ─────────────────────────────────────────────────────
+    if marketplace == "Telegram" and slug and num_int is not None:
+        GetUnique = _payments("GetUniqueStarGiftRequest")
+        if client and GetUnique:
+            full_slug = f"{slug}-{num_int}"
+            res = await _invoke(lambda: GetUnique(slug=full_slug))
+            g = getattr(res, "gift", res)
+            item = serialize_unique(g)
+            if item.get("price") is not None:
+                log.info("promo_auto_fetch Telegram found %s (direct lookup)", full_slug)
+                return {
+                    "price":    str(item.get("price", "")) if item.get("price") is not None else "",
+                    "currency": item.get("currency", "Stars"),
+                    "model":    item.get("model")    or "",
+                    "symbol":   item.get("symbol")   or "",
+                    "backdrop": item.get("backdrop") or "",
+                    "url":      item.get("url")      or f"https://t.me/nft/{full_slug}",
+                }
+            log.info("promo_auto_fetch Telegram %s exists but isn't currently listed for sale", full_slug)
         return {}
 
     # ── Fragment (scraper — num captured per item) ─────────────────────────────
     if marketplace == "Fragment" and slug:
-        try:
-            fslug = slug.lower()
-            listings = await fragment_search(fslug, collection_name or slug, limit=200)
-            for item in listings:
-                if item.get("num") == num_int:
-                    log.info("promo_auto_fetch Fragment found #%s", num_int)
-                    return {
-                        "price":    str(item.get("price", "")) if item.get("price") is not None else "",
-                        "currency": item.get("currency", "TON"),
-                        "model":    item.get("model")    or "",
-                        "symbol":   item.get("symbol")   or "",
-                        "backdrop": item.get("backdrop") or "",
-                        "url":      item.get("url")      or f"https://fragment.com/gift/{fslug}-{num}",
-                    }
-            log.info("promo_auto_fetch Fragment #%s not found", num_int)
-        except Exception as e:
-            log.info("promo_auto_fetch Fragment error: %s", e)
+        fslug = slug.lower()
+        listings = await fragment_search(fslug, collection_name or slug, limit=200)
+        for item in listings:
+            if item.get("num") == num_int:
+                log.info("promo_auto_fetch Fragment found #%s", num_int)
+                return {
+                    "price":    str(item.get("price", "")) if item.get("price") is not None else "",
+                    "currency": item.get("currency", "TON"),
+                    "model":    item.get("model")    or "",
+                    "symbol":   item.get("symbol")   or "",
+                    "backdrop": item.get("backdrop") or "",
+                    "url":      item.get("url")      or f"https://fragment.com/gift/{fslug}-{num}",
+                }
+        log.info("promo_auto_fetch Fragment #%s not found", num_int)
         return {}
 
     # ── MarketApp (item_num_from / item_num_to exact filter) ──────────────────
     if marketplace == "MarketApp" and MARKETAPP_TOKEN and num_int is not None:
-        try:
-            coll_addr = await _marketapp_collection_address(collection_name, slug)
-            if not coll_addr:
-                log.info("promo_auto_fetch MarketApp: no address for %r", slug)
-                return {}
-            async with httpx.AsyncClient(timeout=12) as cli:
-                r = await cli.get(f"{MARKETAPP_BASE}/v1/gifts/onsale/",
-                                  params={"collection_address": coll_addr,
-                                          "item_num_from": num_int, "item_num_to": num_int},
-                                  headers={"Authorization": MARKETAPP_TOKEN})
-            if r.status_code == 200:
-                data = r.json()
-                items = (data.get("items") or []) if isinstance(data, dict) else []
-                if items:
-                    mapped = _marketapp_item(items[0], collection_name or slug, slug, gift_id)
-                    if mapped:
-                        log.info("promo_auto_fetch MarketApp found #%s", num_int)
-                        return {
-                            "price":    str(mapped.get("price", "")) if mapped.get("price") is not None else "",
-                            "currency": mapped.get("currency", "GRAM"),
-                            "model":    mapped.get("model")    or "",
-                            "symbol":   mapped.get("symbol")   or "",
-                            "backdrop": mapped.get("backdrop") or "",
-                            "url":      mapped.get("url")      or "",
-                        }
-            log.info("promo_auto_fetch MarketApp #%s status=%s", num_int, r.status_code if 'r' in dir() else "?")
-        except Exception as e:
-            log.info("promo_auto_fetch MarketApp error: %s", e)
+        coll_addr = await _marketapp_collection_address(collection_name, slug)
+        if not coll_addr:
+            log.info("promo_auto_fetch MarketApp: no address for %r", slug)
+            raise RuntimeError(f"no collection address for {slug!r}")
+        async with httpx.AsyncClient(timeout=12) as cli:
+            r = await cli.get(f"{MARKETAPP_BASE}/v1/gifts/onsale/",
+                              params={"collection_address": coll_addr,
+                                      "item_num_from": num_int, "item_num_to": num_int},
+                              headers={"Authorization": MARKETAPP_TOKEN})
+        if r.status_code != 200:
+            raise RuntimeError(f"marketapp status={r.status_code}")
+        data = r.json()
+        items = (data.get("items") or []) if isinstance(data, dict) else []
+        if items:
+            mapped = _marketapp_item(items[0], collection_name or slug, slug, gift_id)
+            if mapped:
+                log.info("promo_auto_fetch MarketApp found #%s", num_int)
+                return {
+                    "price":    str(mapped.get("price", "")) if mapped.get("price") is not None else "",
+                    "currency": mapped.get("currency", "GRAM"),
+                    "model":    mapped.get("model")    or "",
+                    "symbol":   mapped.get("symbol")   or "",
+                    "backdrop": mapped.get("backdrop") or "",
+                    "url":      mapped.get("url")      or "",
+                }
+        log.info("promo_auto_fetch MarketApp #%s not found", num_int)
         return {}
 
     return {}
@@ -2171,9 +2162,14 @@ def _marketapp_item(raw, gift_name, fallback_slug, gift_id=None):
     else:
         url = "https://marketapp.ws/gifts/"
     backdrop_name = _attr("backdrop", "background") or ""
+    # MarketApp's own "name" field already includes the item number, e.g.
+    # "Plush Pepe #476" — strip that suffix so the frontend (which appends
+    # " #{num}" itself for every marketplace) doesn't show it twice.
+    raw_name = str(raw.get("name") or "").strip()
+    clean_name = _re.sub(r"\s*#\d+\s*$", "", raw_name).strip() or gift_name
     return {
         "id": nft_address or f"ma-{slug}-{num}",
-        "name": raw.get("name") or gift_name,
+        "name": clean_name,
         "slug": slug, "num": num,
         "price": price, "currency": currency, "gram_value": gram_value,
         "model":   _attr("model") or "",
@@ -3212,14 +3208,21 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
 _promo_verify_ts: dict = {}   # pid -> last_verified unix ts
 
 async def _bg_verify_promo(p: dict):
-    """Background: re-check a specific-num promo is still listed; mark sold if not."""
+    """Background: re-check a specific-num promo is still listed; mark sold if not.
+    A lookup error (network hiccup, marketplace API hiccup, etc.) is NOT treated
+    as "sold" — only a confirmed, successful lookup that finds nothing does that.
+    Otherwise a brief outage could wrongly mark a perfectly live gift as sold."""
     pid = p.get("id") or ""
     if not pid:
         return
-    fetch = await _promo_auto_fetch(
-        p.get("marketplace") or "", p.get("slug") or "",
-        p.get("gift_id") or "", p.get("num") or "",
-        p.get("collection") or "")
+    try:
+        fetch = await _promo_auto_fetch(
+            p.get("marketplace") or "", p.get("slug") or "",
+            p.get("gift_id") or "", p.get("num") or "",
+            p.get("collection") or "")
+    except Exception as e:
+        log.info("promo %s verify skipped (inconclusive): %s", pid, e)
+        return
     if not fetch:
         _promo_set_status(pid, "sold")
         log.info("promo %s marked sold: listing no longer found on %s", pid, p.get("marketplace"))
@@ -3336,7 +3339,7 @@ async def check_listings(payload: dict = Body(...)):
         # that marketplace's lookup needs. Older saved items (saved before this
         # check existed) may be missing gift_id/slug — skip rather than risk
         # wrongly flagging a still-live gift as sold.
-        if mkt == "Telegram" and not gift_id:
+        if mkt == "Telegram" and not slug:
             return
         if mkt == "Fragment" and not slug:
             return
@@ -3595,6 +3598,9 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
     link = _clamp(payload.get("link", ""), 256)
     if not link.startswith("https://"):
         link = ""
+    market_url = _clamp(payload.get("marketUrl", ""), 256)
+    if not market_url.startswith("https://"):
+        market_url = ""
     _mid = " \u00b7 "
     # Count the share the moment it's initiated — a share is a share whether
     # Telegram serves the prepared card or the plain sheet.
@@ -3606,10 +3612,14 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
     segs = [("bold", title), ("text", "\n")]
     segs.append(("text", f"{market}{(_mid + price) if price else ''}"))
     segs.append(("text", "\n\nScout unique Telegram gifts on GiftTrove"))
+    # Two honestly-labeled links: one back into GiftTrove (so the recipient
+    # lands on this exact gift), one straight to the live marketplace listing.
     if link:
-        # Show a clean clickable phrase instead of a raw https:// URL.
         segs.append(("text", "\n"))
-        segs.append(("link", f"View on {market}", link))
+        segs.append(("link", "Open in GiftTrove", link))
+    if market_url:
+        segs.append(("text", "\n"))
+        segs.append(("link", f"View on {market}", market_url))
 
     text, off, entities = "", 0, []
     for seg in segs:
