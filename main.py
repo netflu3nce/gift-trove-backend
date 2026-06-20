@@ -439,6 +439,20 @@ def track_search(gift):
         log.info("track_search skipped: %s", e)
 
 
+def _bump_event(kind):
+    """Record a lightweight analytics event (e.g. 'inline', 'open'). Safe no-op
+    on any DB hiccup — analytics must never break a user-facing path."""
+    k = (kind or "").strip()[:24]
+    if not k:
+        return
+    try:
+        with db() as conn:
+            conn.execute("INSERT INTO events(kind, ts) VALUES(?, ?)", (k, int(time.time())))
+            conn.commit()
+    except Exception as e:
+        log.info("bump_event(%s) skipped: %s", k, e)
+
+
 def track_share(gift):
     """Count a successful share of a gift collection (Postgres-safe upsert)."""
     if not gift:
@@ -1218,10 +1232,11 @@ async def _daily_digest_loop():
                 opens24 = q("SELECT COUNT(*) c FROM events WHERE kind IN ('open','new_member') AND ts>?", (day,))
                 searches24 = q("SELECT COUNT(*) c FROM events WHERE kind='search' AND ts>?", (day,))
                 shares24 = q("SELECT COUNT(*) c FROM events WHERE kind='share' AND ts>?", (day,))
+                inline24 = q("SELECT COUNT(*) c FROM events WHERE kind='inline' AND ts>?", (day,))
                 toprow = conn.execute("SELECT gift, count FROM gift_searches ORDER BY count DESC LIMIT 1").fetchone()
             top_line = f"{toprow['gift']} ({toprow['count']} scouts)" if toprow else "none yet"
             txt = (
-                f"Last 24h — opens: {opens24}, searches: {searches24}, shares: {shares24}, new members: {new24}.\n"
+                f"Last 24h — opens: {opens24}, searches: {searches24}, shares: {shares24}, inline: {inline24}, new members: {new24}.\n"
                 f"Total members: {members}.\n"
                 f"Top scouted gift overall: {top_line}.\n"
                 f"DB: {'Postgres' if USE_PG else 'SQLite'} — MTProto: {'live' if (client and client.is_connected()) else 'down'}."
@@ -1235,6 +1250,162 @@ async def _daily_digest_loop():
 # ─── Telethon client lifecycle ────────────────────────────────────────────────
 client = None
 bot = None
+
+
+# ─── Inline mode: warm floor cache + fast lookups ────────────────────────────
+# Inline has a tight latency budget (Telegram wants an answer in ~1-2s). We never
+# block an inline query on a slow live scrape: collection floors come from a warm
+# cache refreshed in the background, and an exact-gift lookup is a single direct
+# MTProto call wrapped in a short timeout with a graceful fall-back to the floor.
+_INLINE_FLOOR_TTL = 180          # seconds a cached collection floor stays fresh
+_inline_floor_cache: dict = {}   # gift_id(str) -> (unix_ts, serialized_listing | None)
+_INLINE_WARM_TOP = 60            # how many top collections the warmer keeps hot
+
+
+async def _cheapest_listing(gift_id):
+    """The single cheapest live Telegram listing for a collection, or None.
+    One MTProto call, price-sorted, limit=1 — the fast primitive inline needs."""
+    GetResale = _payments("GetResaleStarGiftsRequest")
+    if client is None or not GetResale or not gift_id:
+        return None
+    res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0,
+                                          sort_by_price=True, offset="", limit=1))
+    g = getattr(res, "gifts", []) or []
+    return serialize_unique(g[0]) if g else None
+
+
+async def _inline_floor(gift_id, timeout=1.6):
+    """Cached cheapest listing for a collection. Serves a warm cache instantly;
+    on a miss does ONE short live lookup (never hangs inline). Returns the
+    serialized listing dict or None."""
+    if not gift_id:
+        return None
+    key = str(gift_id)
+    hit = _inline_floor_cache.get(key)
+    now = time.time()
+    if hit and (now - hit[0]) < _INLINE_FLOOR_TTL:
+        return hit[1]
+    try:
+        item = await asyncio.wait_for(_cheapest_listing(key), timeout=timeout)
+    except Exception:
+        # On any error/timeout fall back to a stale cached value if we have one,
+        # else None — inline must always answer fast.
+        return hit[1] if hit else None
+    _inline_floor_cache[key] = (now, item)
+    return item
+
+
+async def _inline_exact_gift(gift_id, slug, num, timeout=1.6):
+    """Live data for an EXACT gift number via direct unique-gift lookup (reliable,
+    O(1)). Returns the serialized listing dict or None. Short timeout so a slow
+    lookup never makes inline feel broken — the caller falls back to the floor."""
+    GetUnique = _payments("GetUniqueStarGiftRequest")
+    if client is None or not GetUnique or not slug or not num:
+        return None
+    full = f"{slug}-{num}"
+    try:
+        res = await asyncio.wait_for(
+            _invoke(lambda: GetUnique(slug=full)), timeout=timeout)
+    except Exception:
+        return None
+    g = getattr(res, "gift", res)
+    try:
+        return serialize_unique(g)
+    except Exception:
+        return None
+
+
+async def _warm_inline_floors():
+    """Background: keep the top collections' floor prices hot so inline answers
+    are sub-100ms cache reads. Runs gently, well within MTProto limits."""
+    while True:
+        try:
+            await asyncio.sleep(150)   # refresh cycle; slightly under the TTL
+            cols = cache_get("collections") or []
+            for c in cols[:_INLINE_WARM_TOP]:
+                gid = c.get("gift_id")
+                if not gid:
+                    continue
+                try:
+                    item = await asyncio.wait_for(_cheapest_listing(str(gid)), timeout=8)
+                    _inline_floor_cache[str(gid)] = (time.time(), item)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.4)   # gentle pacing between collections
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.info("_warm_inline_floors error: %s", e)
+
+
+def _fmt_price(item):
+    """'380 GRAM' / '12.5 TON' / 'Stars' — a compact price label for inline cards."""
+    if not item:
+        return ""
+    price = item.get("price")
+    if price is None:
+        return ""
+    cur = item.get("currency") or "GRAM"
+    try:
+        n = float(price)
+        amt = f"{int(n):,}" if n == int(n) else f"{n:,.2f}"
+    except Exception:
+        amt = str(price)
+    return f"{amt} {cur}"
+
+
+def _inline_deep_link(slug, sender_uid):
+    """A GiftTrove deep-link to a specific gift carrying the SENDER's current
+    referral code (resolved from our own records) so inline sharing drives
+    referrals just like the in-app share does."""
+    code = get_ref_code(sender_uid) if sender_uid else ""
+    if slug:
+        return f"{MINIAPP_URL}?startapp=g_{slug}_{code}" if code else f"{MINIAPP_URL}?startapp=g_{slug}"
+    return f"{MINIAPP_URL}?startapp={code}" if code else MINIAPP_URL
+
+
+def _parse_inline_query(q, cols):
+    """Parse inline text into an intent.
+    Returns (kind, collection, num) where kind is:
+      'empty'      -> show featured/trending entry points
+      'collection' -> floor + cheapest few for a matched collection
+      'gift'       -> an exact gift number within a matched collection
+      'cheap'      -> cheapest-first list for a matched collection
+    collection is the matched cached collection dict (or None)."""
+    q = (q or "").strip()
+    if not q:
+        return ("empty", None, "")
+    toks = q.split()
+    # Trailing explicit number (e.g. "chill flame 50090" or "... #50090")
+    num = ""
+    name_toks = toks[:]
+    if toks and (toks[-1].lstrip("#").isdigit()):
+        num = toks[-1].lstrip("#")
+        name_toks = toks[:-1]
+    # "cheap"/"low" verb anywhere -> sorted floor list
+    verb_cheap = any(t.lower() in ("cheap", "cheapest", "low", "lowest", "floor") for t in name_toks)
+    name_toks = [t for t in name_toks if t.lower() not in ("cheap", "cheapest", "low", "lowest", "floor")]
+    name = " ".join(name_toks).strip().lower()
+
+    col = None
+    if name:
+        # exact name match first, then prefix, then substring
+        col = next((c for c in cols if (c.get("name", "").lower() == name)), None)
+        if not col:
+            col = next((c for c in cols if c.get("name", "").lower().startswith(name)), None)
+        if not col:
+            col = next((c for c in cols if name in c.get("name", "").lower()), None)
+    elif num:
+        # number only, no name — can't resolve a collection
+        col = None
+
+    if col and num:
+        return ("gift", col, num)
+    if col and verb_cheap:
+        return ("cheap", col, "")
+    if col:
+        return ("collection", col, "")
+    return ("empty", None, "")
 
 
 async def _register_bot_handlers():
@@ -1287,45 +1458,164 @@ async def _register_bot_handlers():
                 except Exception:
                     pass
 
-    # ── Inline search: @gifttrovebot <gift> [backdrop] [model] [symbol] ──────
-    # Works in any DM / group. Each result opens the Mini App on that collection.
+    # ── Inline scouting: @gifttrovebot <query> — works in any DM / group ─────
+    # Grammar (see _parse_inline_query):
+    #   <empty>              -> trending collections with live floors
+    #   <collection>         -> that collection's live floor (+ open card)
+    #   <collection> <num>   -> an exact gift's live price/model/backdrop/symbol
+    #   <collection> cheap   -> cheapest-first individual listings
+    # Every card carries the sender's referral code and links to both GiftTrove
+    # and the live marketplace listing. Answers come from a warm floor cache so
+    # they stay within Telegram's tight inline latency budget.
     @bot.on(events.InlineQuery)
     async def _inline(event):
         q = (event.text or "").strip()
+        sender_uid = str(getattr(event, "sender_id", "") or "")
         cols = cache_get("collections") or []
-        ql = q.lower()
-        first = ql.split()[0] if ql else ""
-        # 1-3 best matches; tapping launches the Mini App straight onto that gift.
-        matches = ([c for c in cols if first and first in (c.get("name", "").lower())][:3]
-                   if first else cols[:3])
         builder = event.builder
+        kind, col, num = _parse_inline_query(q, cols)
+
+        def _gift_thumb(slug):
+            # Reuse the same Fragment CDN image the app uses (correctly lowercased).
+            return cdn_image(slug) if slug else None
+
+        def _card(title, desc, body_segs, slug, market, market_url):
+            """Build one inline article result. body_segs is a list of plain
+            strings already joined; we attach two honest buttons + a thumbnail."""
+            deep = _inline_deep_link(slug, sender_uid)
+            btns = [[Button.url("Open in GiftTrove", deep)]]
+            if market_url:
+                btns.append([Button.url(f"View on {market}", market_url)])
+            kw = {"title": title, "description": desc, "text": body_segs, "buttons": btns,
+                  "link_preview": False}
+            thumb = _gift_thumb(slug)
+            if thumb:
+                kw["thumb"] = thumb
+            return builder.article(**kw)
+
         results = []
         try:
-            for c in matches:
-                gid = c.get("gift_id")
-                name = c.get("name", "Gift")
-                slug = c.get("slug") or ""
-                link = f"{MINIAPP_URL}?startapp=q_{gid}" if gid else MINIAPP_URL
-                thumb = f"https://nft.fragment.com/gift/{slug}-1.large.jpg" if slug else None
-                kw = {
-                    "title": name,
-                    "description": f"Scout {name} — live floor & listings",
-                    "text": f"{name} on GiftTrove\nTap to scout live listings across Telegram marketplaces.",
-                    "buttons": [Button.url(f"Open {name}", link)],
-                }
-                if thumb:
-                    kw["thumb"] = thumb
-                results.append(builder.article(**kw))
+            if kind == "gift":
+                # Exact gift number: one precise live card.
+                gid = col.get("gift_id"); name = col.get("name", "Gift")
+                cslug = col.get("slug") or ""
+                item = await _inline_exact_gift(gid, cslug, num)
+                if item:
+                    slug = item.get("slug") or f"{cslug}-{num}"
+                    price = _fmt_price(item)
+                    mkt = item.get("market") or "Telegram"
+                    attrs = " \u00b7 ".join([a for a in (
+                        (f"Model: {item.get('model')}" if item.get("model") else ""),
+                        (f"Backdrop: {item.get('backdrop')}" if item.get("backdrop") else ""),
+                        (f"Symbol: {item.get('symbol')}" if item.get("symbol") else "")) if a])
+                    title = f"{name} #{num}"
+                    body = f"{title}\n{('Floor: ' + price + ' \u00b7 ') if price else ''}{mkt}"
+                    if attrs:
+                        body += f"\n{attrs}"
+                    body += "\n\nScout live listings on GiftTrove"
+                    results.append(_card(title, (price + " \u00b7 " + mkt) if price else mkt,
+                                         body, slug, mkt, item.get("url") or ""))
+                else:
+                    # Couldn't confirm that exact number — fall back to the floor.
+                    floor = await _inline_floor(col.get("gift_id"))
+                    name = col.get("name", "Gift")
+                    if floor:
+                        slug = floor.get("slug") or ""
+                        price = _fmt_price(floor); mkt = floor.get("market") or "Telegram"
+                        title = f"{name} \u2014 floor {price}" if price else name
+                        body = (f"{name}\nCouldn't find #{num} listed right now. "
+                                f"Cheapest available: {price} on {mkt}." if price else
+                                f"{name}\nCouldn't find #{num} listed right now.")
+                        body += "\n\nScout live listings on GiftTrove"
+                        results.append(_card(title, f"#{num} not listed \u00b7 see floor",
+                                             body, slug, mkt, floor.get("url") or ""))
+
+            elif kind in ("collection", "cheap"):
+                gid = col.get("gift_id"); name = col.get("name", "Gift")
+                cslug = col.get("slug") or ""
+                floor = await _inline_floor(gid)
+                # Lead card: the collection's live floor.
+                if floor:
+                    slug = floor.get("slug") or ""
+                    price = _fmt_price(floor); mkt = floor.get("market") or "Telegram"
+                    title = f"{name} \u2014 floor {price}" if price else f"{name}"
+                    body = (f"{name}\nFloor: {price} \u00b7 {mkt}" if price else f"{name}")
+                    body += "\n\nScout live listings across marketplaces on GiftTrove"
+                    results.append(_card(title, (f"Floor {price} \u00b7 {mkt}") if price else "Live listings",
+                                         body, slug, mkt, floor.get("url") or ""))
+                else:
+                    # No floor available — still offer to open the collection.
+                    slug = f"{cslug}-1" if cslug else ""
+                    body = f"{name}\nTap to scout live listings on GiftTrove."
+                    results.append(_card(name, "Scout live listings", body, slug, "Telegram", ""))
+
+                # For "cheap": add a few more individual cheapest listings.
+                if kind == "cheap":
+                    GetResale = _payments("GetResaleStarGiftsRequest")
+                    if GetResale and gid:
+                        try:
+                            res = await asyncio.wait_for(
+                                _invoke(lambda: GetResale(gift_id=int(gid), attributes_hash=0,
+                                                          sort_by_price=True, offset="", limit=6)),
+                                timeout=1.8)
+                            gifts = getattr(res, "gifts", []) or []
+                            for g in gifts:
+                                it = serialize_unique(g)
+                                slug = it.get("slug") or ""
+                                price = _fmt_price(it); mkt = it.get("market") or "Telegram"
+                                gn = it.get("num")
+                                title = f"{name} #{gn} \u2014 {price}" if price else f"{name} #{gn}"
+                                body = f"{name}{(' #' + str(gn)) if gn is not None else ''}\n{price} \u00b7 {mkt}\n\nScout it on GiftTrove"
+                                results.append(_card(title, f"{price} \u00b7 {mkt}" if price else mkt,
+                                                     body, slug, mkt, it.get("url") or ""))
+                        except Exception:
+                            pass
+
+            # 'empty' or nothing matched: a few trending entry points. These read
+            # ONLY the warm floor cache (never a live lookup) so the discovery
+            # view is always instant even when the cache is cold right after a
+            # deploy — a missing floor just shows the collection without a price.
             if not results:
-                results.append(builder.article(
+                for c in cols[:6]:
+                    gid = c.get("gift_id"); name = c.get("name", "Gift")
+                    cslug = c.get("slug") or ""
+                    hit = _inline_floor_cache.get(str(gid)) if gid else None
+                    floor = hit[1] if hit else None
+                    price = _fmt_price(floor) if floor else ""
+                    slug = (floor.get("slug") if floor else (f"{cslug}-1" if cslug else "")) or ""
+                    mkt = (floor.get("market") if floor else "Telegram") or "Telegram"
+                    murl = floor.get("url") if floor else ""
+                    title = f"{name} \u2014 floor {price}" if price else name
+                    body = (f"{name}\nFloor: {price} \u00b7 {mkt}" if price else
+                            f"{name}\nTap to scout live listings on GiftTrove.")
+                    body += "\n\nScout unique Telegram gifts on GiftTrove"
+                    results.append(_card(title, (f"Floor {price}") if price else "Scout live listings",
+                                         body, slug, mkt, murl))
+
+            # Always-present escape hatch.
+            results.append(builder.article(
+                title="Open GiftTrove",
+                description="Scout unique Telegram gifts",
+                text="Scout unique Telegram gifts on GiftTrove.",
+                buttons=[[Button.url("Open GiftTrove", _inline_deep_link("", sender_uid))]],
+            ))
+
+            await event.answer(results[:10], cache_time=30, private=True)
+            try:
+                _bump_event("inline")
+            except Exception:
+                pass
+        except Exception as e:
+            log.info("inline answer failed: %s", e)
+            try:
+                await event.answer([builder.article(
                     title="Open GiftTrove",
                     description="Scout unique Telegram gifts",
                     text="Scout unique Telegram gifts on GiftTrove.",
-                    buttons=[Button.url("Open GiftTrove", MINIAPP_URL)],
-                ))
-            await event.answer(results, cache_time=20, private=True)
-        except Exception as e:
-            log.info("inline answer failed: %s", e)
+                    buttons=[[Button.url("Open GiftTrove", MINIAPP_URL)]],
+                )], cache_time=10, private=True)
+            except Exception:
+                pass
 
     # ── Fragment promotion review (admin Approve / Decline buttons) ───────────
     @bot.on(events.CallbackQuery(pattern=b"^p(approve|decline):"))
@@ -1469,39 +1759,49 @@ async def _record_payment(action):
         coll_name = promo.get("collection") or ""
         # Auto-fetch listing data: price, model, symbol, backdrop from the marketplace.
         # No manual admin review — every marketplace is handled programmatically.
+        fetch = {}
         try:
             fetch = await _promo_auto_fetch(mkt, slug, gift_id, num, coll_name)
             if fetch:
                 _promo_set_price(pid, fetch.get("price", ""), fetch.get("currency", ""))
                 _promo_set_attrs(pid, fetch.get("model"), fetch.get("symbol"),
                                  fetch.get("backdrop"), fetch.get("url"))
-            else:
-                log.info("promo_auto_fetch: no listing found, activating with floor price")
-                amt, cur = await _promo_fetch_price(gift_id)
-                if amt:
-                    _promo_set_price(pid, amt, cur)
         except Exception as e:
-            log.info("promo activation fetch error: %s", e)
-        exp = _promo_activate(pid, uid, charge_id)
-        log.info("promotion active: id=%s uid=%s mkt=%s num=%s until=%s", pid, uid, mkt, num, exp)
-        try:
-            gift_url = (f"https://t.me/nft/{slug}-{num}" if slug and num else
-                        f"https://marketapp.ws/" if mkt == "MarketApp" else "")
-            label = _gift_label(coll_name, num)
-            if fetch:
-                # Listing found — confirmation: "{gift} is live for N days ..."
-                gift_url = fetch.get("url") or gift_url
+            # A transient lookup error is NOT a confirmed "not listed". Leave fetch
+            # empty so we park it as unlisted (with free retry) rather than wrongly
+            # showing an unverified gift — and the member keeps their retry.
+            log.info("promo activation fetch error (treated as inconclusive): %s", e)
+            fetch = {}
+        if fetch:
+            # Listing found — activate and show at the top of matching scouts.
+            exp = _promo_activate(pid, uid, charge_id)
+            log.info("promotion active: id=%s uid=%s mkt=%s num=%s until=%s", pid, uid, mkt, num, exp)
+            try:
+                gift_url = fetch.get("url") or (
+                    f"https://t.me/nft/{slug}-{num}" if slug and num else
+                    "https://marketapp.ws/" if mkt == "MarketApp" else "")
+                label = _gift_label(coll_name, num)
                 msg = f"{label} is live for {PROMO_DAYS} days and will appear at the top of matching scouts."
                 if gift_url:
                     msg += f"\n{gift_url}"
                 await _dm(uid, msg, bold_ranges=[(0, len(label))])
-            else:
-                # Listing not found — tell them to cross-check and try again.
+            except Exception:
+                pass
+        else:
+            # Listing NOT found — do NOT activate (never shows in search) and do NOT
+            # refund (the Stars are kept; entering a gift that isn't listed is the
+            # member's mistake). The promo is parked as 'unlisted' and is simply
+            # spent — no free retry. They can promote again (paying again) if they
+            # correct the gift number.
+            _promo_set_status(pid, "unlisted")
+            log.info("promotion unlisted (not activated, no refund): id=%s uid=%s mkt=%s num=%s", pid, uid, mkt, num)
+            try:
+                label = _gift_label(coll_name, num)
                 msg = (f"You promoted {label} which is currently not listed on {mkt}. "
                        f"Kindly cross check the information properly and try again.")
                 await _dm(uid, msg, bold_ranges=[(len("You promoted "), len(label))])
-        except Exception:
-            pass
+            except Exception:
+                pass
     else:
         log.info("payment with unrecognized payload: %r", payload)
 
@@ -1641,6 +1941,7 @@ async def background_telethon_initializer():
         except Exception as e:
             log.info("collections pre-warm skipped: %s", e)
         asyncio.create_task(_bg_expire_promos())
+        asyncio.create_task(_warm_inline_floors())
 
     # 2c) Reports: deploy-live good news + the daily digest loop.
     try:
