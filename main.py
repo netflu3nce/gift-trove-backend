@@ -1504,16 +1504,16 @@ async def _register_bot_handlers():
                     slug = item.get("slug") or f"{cslug}-{num}"
                     price = _fmt_price(item)
                     mkt = item.get("market") or "Telegram"
-                    attrs = " \u00b7 ".join([a for a in (
+                    attrs = " · ".join([a for a in (
                         (f"Model: {item.get('model')}" if item.get("model") else ""),
                         (f"Backdrop: {item.get('backdrop')}" if item.get("backdrop") else ""),
                         (f"Symbol: {item.get('symbol')}" if item.get("symbol") else "")) if a])
                     title = f"{name} #{num}"
-                    body = f"{title}\n{('Floor: ' + price + ' \u00b7 ') if price else ''}{mkt}"
+                    body = f"{title}\n{('Floor: ' + price + ' · ') if price else ''}{mkt}"
                     if attrs:
                         body += f"\n{attrs}"
                     body += "\n\nScout live listings on GiftTrove"
-                    results.append(_card(title, (price + " \u00b7 " + mkt) if price else mkt,
+                    results.append(_card(title, (price + " · " + mkt) if price else mkt,
                                          body, slug, mkt, item.get("url") or ""))
                 else:
                     # Couldn't confirm that exact number — fall back to the floor.
@@ -1522,12 +1522,12 @@ async def _register_bot_handlers():
                     if floor:
                         slug = floor.get("slug") or ""
                         price = _fmt_price(floor); mkt = floor.get("market") or "Telegram"
-                        title = f"{name} \u2014 floor {price}" if price else name
+                        title = f"{name} — floor {price}" if price else name
                         body = (f"{name}\nCouldn't find #{num} listed right now. "
                                 f"Cheapest available: {price} on {mkt}." if price else
                                 f"{name}\nCouldn't find #{num} listed right now.")
                         body += "\n\nScout live listings on GiftTrove"
-                        results.append(_card(title, f"#{num} not listed \u00b7 see floor",
+                        results.append(_card(title, f"#{num} not listed · see floor",
                                              body, slug, mkt, floor.get("url") or ""))
 
             elif kind in ("collection", "cheap"):
@@ -1538,10 +1538,10 @@ async def _register_bot_handlers():
                 if floor:
                     slug = floor.get("slug") or ""
                     price = _fmt_price(floor); mkt = floor.get("market") or "Telegram"
-                    title = f"{name} \u2014 floor {price}" if price else f"{name}"
-                    body = (f"{name}\nFloor: {price} \u00b7 {mkt}" if price else f"{name}")
+                    title = f"{name} — floor {price}" if price else f"{name}"
+                    body = (f"{name}\nFloor: {price} · {mkt}" if price else f"{name}")
                     body += "\n\nScout live listings across marketplaces on GiftTrove"
-                    results.append(_card(title, (f"Floor {price} \u00b7 {mkt}") if price else "Live listings",
+                    results.append(_card(title, (f"Floor {price} · {mkt}") if price else "Live listings",
                                          body, slug, mkt, floor.get("url") or ""))
                 else:
                     # No floor available — still offer to open the collection.
@@ -1564,9 +1564,9 @@ async def _register_bot_handlers():
                                 slug = it.get("slug") or ""
                                 price = _fmt_price(it); mkt = it.get("market") or "Telegram"
                                 gn = it.get("num")
-                                title = f"{name} #{gn} \u2014 {price}" if price else f"{name} #{gn}"
-                                body = f"{name}{(' #' + str(gn)) if gn is not None else ''}\n{price} \u00b7 {mkt}\n\nScout it on GiftTrove"
-                                results.append(_card(title, f"{price} \u00b7 {mkt}" if price else mkt,
+                                title = f"{name} #{gn} — {price}" if price else f"{name} #{gn}"
+                                body = f"{name}{(' #' + str(gn)) if gn is not None else ''}\n{price} · {mkt}\n\nScout it on GiftTrove"
+                                results.append(_card(title, f"{price} · {mkt}" if price else mkt,
                                                      body, slug, mkt, it.get("url") or ""))
                         except Exception:
                             pass
@@ -1585,8 +1585,8 @@ async def _register_bot_handlers():
                     slug = (floor.get("slug") if floor else (f"{cslug}-1" if cslug else "")) or ""
                     mkt = (floor.get("market") if floor else "Telegram") or "Telegram"
                     murl = floor.get("url") if floor else ""
-                    title = f"{name} \u2014 floor {price}" if price else name
-                    body = (f"{name}\nFloor: {price} \u00b7 {mkt}" if price else
+                    title = f"{name} — floor {price}" if price else name
+                    body = (f"{name}\nFloor: {price} · {mkt}" if price else
                             f"{name}\nTap to scout live listings on GiftTrove.")
                     body += "\n\nScout unique Telegram gifts on GiftTrove"
                     results.append(_card(title, (f"Floor {price}") if price else "Scout live listings",
