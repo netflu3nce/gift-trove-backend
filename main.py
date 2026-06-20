@@ -1102,6 +1102,46 @@ ADMIN_REPORTS = os.getenv("ADMIN_REPORTS", "1") == "1"
 _REPORT_PREFIX = {"good": "GOOD NEWS", "warning": "WARNING", "issue": "ISSUE", "digest": "DAILY DIGEST"}
 
 
+def _gift_label(name, num):
+    """Consistent 'Gift Name #1234' label used across all user-facing DMs."""
+    nm = (name or "your gift").strip()
+    n = str(num or "").strip()
+    return f"{nm} #{n}" if n else nm
+
+
+async def _dm(uid, text, bold_ranges=None):
+    """Send a plain DM to a user, optionally bolding given (start,len) char ranges.
+    Bold is applied via MTProto entities (so it renders) with a graceful fallback
+    to a plain Bot API message. bold_ranges are in PYTHON string indices; we
+    convert to UTF-16 units that Telegram entities require."""
+    if not uid:
+        return False
+    txt = str(text or "")
+    if bot is not None and bold_ranges:
+        try:
+            from telethon.tl.types import MessageEntityBold
+            def _u16(s):
+                return len(s.encode("utf-16-le")) // 2
+            ents = []
+            for start, length in bold_ranges:
+                if start < 0 or length <= 0 or start + length > len(txt):
+                    continue
+                off = _u16(txt[:start])
+                ln = _u16(txt[start:start + length])
+                ents.append(MessageEntityBold(off, ln))
+            if ents:
+                await bot.send_message(int(uid), txt, formatting_entities=ents)
+                return True
+        except Exception as e:
+            log.info("_dm bold send failed, falling back to plain: %s", e)
+    try:
+        await _bot_api("sendMessage", {"chat_id": int(uid), "text": txt})
+        return True
+    except Exception as e:
+        log.info("_dm plain send failed: %s", e)
+        return False
+
+
 async def notify_admin(text, level="issue"):
     if not ADMIN_REPORTS:
         return
@@ -1409,7 +1449,15 @@ async def _record_payment(action):
                 _affiliate_credit(ref, uid, tier, cut, charge_id)
         except Exception as e:
             log.info("affiliate credit skipped: %s", e)
-        await _send_sub_confirmation(uid, tier)
+        # Detect a plan change (had a different active tier before) so the
+        # confirmation can remind them to cancel the previous subscription.
+        switched_from = ""
+        try:
+            if prev and prev[0] and prev[0] != tier:
+                switched_from = prev[0]
+        except Exception:
+            switched_from = ""
+        await _send_sub_confirmation(uid, tier, switched_from=switched_from)
     elif kind == "promo" and len(parts) >= 3:
         pid, uid = parts[1], parts[2]
         _promo_set_charge(pid, charge_id)
@@ -1439,47 +1487,61 @@ async def _record_payment(action):
         try:
             gift_url = (f"https://t.me/nft/{slug}-{num}" if slug and num else
                         f"https://marketapp.ws/" if mkt == "MarketApp" else "")
+            label = _gift_label(coll_name, num)
             if fetch:
-                # Listing found — give them a confirmation with the link.
+                # Listing found — confirmation: "{gift} is live for N days ..."
                 gift_url = fetch.get("url") or gift_url
-                await _bot_api("sendMessage", {"chat_id": int(uid),
-                    "text": (f"Your gift promotion is live for {PROMO_DAYS} days and will appear at the top of matching scouts.\n"
-                             f"Gift: {coll_name}{(' #' + str(num)) if num else ''}"
-                             f"{chr(10) + gift_url if gift_url else ''}")})
+                msg = f"{label} is live for {PROMO_DAYS} days and will appear at the top of matching scouts."
+                if gift_url:
+                    msg += f"\n{gift_url}"
+                await _dm(uid, msg, bold_ranges=[(0, len(label))])
             else:
-                # Listing not found — notify the user; promo is active but invisible until listed.
-                await _bot_api("sendMessage", {"chat_id": int(uid),
-                    "text": (f"Your promotion is active for {PROMO_DAYS} days, but GiftTrove couldn't find "
-                             f"{coll_name}{(' #' + str(num)) if num else ''} currently listed on {mkt}. "
-                             f"It will appear in scout results as soon as it goes on sale. "
-                             f"If it never goes live, the promotion slot will expire unused.")})
+                # Listing not found — tell them to cross-check and try again.
+                msg = (f"You promoted {label} which is currently not listed on {mkt}. "
+                       f"Kindly cross check the information properly and try again.")
+                await _dm(uid, msg, bold_ranges=[(len("You promoted "), len(label))])
         except Exception:
             pass
     else:
         log.info("payment with unrecognized payload: %r", payload)
 
 
-async def _send_sub_confirmation(uid, tier):
+async def _send_sub_confirmation(uid, tier, switched_from=""):
     """DM the member what they just unlocked, led by a premium gold-star custom
     emoji (Premium users see the star; others see the fallback). Sent via the bot's
-    MTProto client so the custom emoji renders, with a plain-text fallback."""
+    MTProto client so the custom emoji renders, with a plain-text fallback.
+    If they switched from another paid tier, a reminder to cancel the previous
+    subscription from Telegram is appended."""
     if bot is None:
         return
     if tier == "pro":
-        line = "Scout Pro unlocked. You can now scout with unlimited filters, claim your own custom referral code, and browse with no promoted gifts in your results."
+        header = "Scout Pro unlocked"
+        body = ("You can now scout with:\n"
+                "\u2726 Unlimited filters\n"
+                "\u2726 Your own custom referral code\n"
+                "\u2726 Earnings from the affiliate program\n"
+                "\u2726 An ad-free results feed with no promoted gifts")
     else:
-        line = "Scout+ unlocked. You can now apply up to 5 of each filter in your scouts."
+        header = "Scout+ unlocked"
+        body = ("You can now upgrade your search with:\n"
+                "\u2726 Up to 5 of each filter per scout")
+    switch_note = ""
+    if switched_from:
+        switch_note = "\n\nYou switched plans \u2014 don't forget to cancel your previous subscription from Telegram so you aren't charged for both."
+    line = f"{header}\n\n{body}{switch_note}"
     try:
         from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityBold
         def u16(s):
             return len(s.encode("utf-16-le")) // 2
         star = "\U0001F396\uFE0F"   # 🎖️ fallback; overlaid by the premium star
-        segs = [("emoji", star, EMOJI_STAR), ("text", " "), ("bold", line)]
+        # star + space + bold(header) + rest
+        rest = f"\n\n{body}{switch_note}"
+        segs = [("emoji", star, EMOJI_STAR), ("text", " "), ("bold", header), ("text", rest)]
         text, off, ents = "", 0, []
-        for kind, *rest in segs:
-            s = rest[0]; ln = u16(s)
+        for kind, *r in segs:
+            s = r[0]; ln = u16(s)
             if kind == "emoji":
-                ents.append(MessageEntityCustomEmoji(off, ln, int(rest[1])))
+                ents.append(MessageEntityCustomEmoji(off, ln, int(r[1])))
             elif kind == "bold":
                 ents.append(MessageEntityBold(off, ln))
             text += s; off += ln
@@ -1490,6 +1552,17 @@ async def _send_sub_confirmation(uid, tier):
             await _bot_api("sendMessage", {"chat_id": int(uid), "text": line})
         except Exception:
             pass
+
+
+async def _send_sub_cancel_confirmation(uid, tier):
+    """DM the member after they cancel, reminding them to also stop the
+    recurring charge from Telegram itself (cancelling in-app marks our records
+    but Telegram manages the actual Stars subscription renewal)."""
+    plan = "Scout Pro" if tier == "pro" else "Scout+"
+    msg = (f"Your {plan} plan has been cancelled on GiftTrove.\n\n"
+           f"Don't forget to cancel your subscription from Telegram as well, so it doesn't renew. "
+           f"You'll keep your current benefits until the active period ends.")
+    await _dm(uid, msg, bold_ranges=[(len("Your "), len(plan))])
 
 
 async def _connect_user_session():
@@ -3104,6 +3177,40 @@ async def subscription(x_init_data: str = Header(default="", alias="X-Init-Data"
             "prices": {"plus": STARS_PLUS, "pro": STARS_PRO},
             "promo_price": PROMO_PRICE, "promo_days": PROMO_DAYS}
 
+@app.post("/api/subscription/cancel")
+async def subscription_cancel(x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Cancel the caller's recurring Stars subscription. We ask Telegram to stop
+    the auto-renewal (so they aren't charged again) and DM a confirmation that
+    also reminds them they keep their benefits until the period ends. The sub
+    row is left intact so existing benefits persist until expires_at."""
+    uid = verify_init_data(x_init_data)
+    if not uid:
+        return {"ok": False, "error": "unauthorized"}
+    tier, exp = sub_info(uid)
+    if tier not in ("plus", "pro"):
+        return {"ok": False, "error": "no_active_subscription"}
+    row = _sub_row(uid)
+    charge_id = row[1] if row else ""
+    cancelled = False
+    if charge_id and bot is not None:
+        try:
+            from telethon.tl import functions as _fn
+            peer = await bot.get_input_entity(int(uid))
+            await bot(_fn.payments.BotCancelStarsSubscriptionRequest(
+                user_id=peer, charge_id=charge_id))
+            cancelled = True
+            log.info("subscription cancel requested: uid=%s tier=%s", uid, tier)
+        except Exception as e:
+            log.warning("subscription cancel via Telegram failed (uid=%s): %s", uid, e)
+    try:
+        await _send_sub_cancel_confirmation(uid, tier)
+    except Exception as e:
+        log.info("cancel confirmation DM failed: %s", e)
+    # Whether or not the API cancel succeeded, point the user to Telegram's own
+    # subscription management as the authoritative place to stop renewal.
+    return {"ok": True, "cancelled": cancelled, "tier": tier, "expires_at": exp}
+
+
 @app.post("/api/create-invoice")
 async def create_invoice(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Create a Telegram Stars subscription invoice link for a tier. Identity is
@@ -3266,11 +3373,19 @@ async def _bg_verify_promo(p: dict):
         gift_url = p.get("link") or (f"https://t.me/nft/{slug}-{num}" if slug and num else "")
         if uid:
             try:
-                await _bot_api("sendMessage", {"chat_id": int(uid),
-                    "text": (f"Your promoted gift {coll}{(' #' + str(num)) if num else ''} "
-                             f"is no longer listed for sale on {mkt}, so it has been removed from scout results. "
-                             f"Your promotion slot remains active until it expires. "
-                             f"{gift_url if gift_url else ''}")})
+                label = _gift_label(coll, num)
+                msg = (f"Congratulations\n\n"
+                       f"Your promoted gift {label} has been purchased. "
+                       f"The gift is no longer displayed in the top search.")
+                if gift_url:
+                    msg += f"\n{gift_url}"
+                # bold the "Congratulations" header + the gift label
+                cong_len = len("Congratulations")
+                label_start = msg.find(label, cong_len)
+                ranges = [(0, cong_len)]
+                if label_start >= 0:
+                    ranges.append((label_start, len(label)))
+                await _dm(uid, msg, bold_ranges=ranges)
             except Exception as e:
                 log.info("sold notify DM failed: %s", e)
 
@@ -3303,12 +3418,12 @@ async def _bg_expire_promos():
                 gift_url = r["link"] or (f"https://t.me/nft/{slug}-{num}" if slug and num else "")
                 if uid:
                     try:
-                        await _bot_api("sendMessage", {"chat_id": int(uid),
-                            "text": (f"Your promotion for {coll}{(' #' + str(num)) if num else ''} "
-                                     f"has ended after {PROMO_DAYS} days. "
-                                     f"It is no longer shown at the top of scout results. "
-                                     f"You can promote it again anytime from the GiftTrove profile tab."
-                                     f"{chr(10) + gift_url if gift_url else ''}")})
+                        label = _gift_label(coll, num)
+                        msg = (f"Your promotion for {label} has ended after {PROMO_DAYS} days. "
+                               f"You can consider adjusting the listed value and trying again.")
+                        if gift_url:
+                            msg += f"\n{gift_url}"
+                        await _dm(uid, msg, bold_ranges=[(len("Your promotion for "), len(label))])
                     except Exception as e:
                         log.info("expiry notify DM failed: %s", e)
         except asyncio.CancelledError:
@@ -3645,12 +3760,21 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
     num = _digits(payload.get("num", ""), 12)
     market = _clamp(payload.get("market", "Telegram"), 24)
     price = _clamp(payload.get("price", ""), 40)
-    link = _clamp(payload.get("link", ""), 256)
-    if not link.startswith("https://"):
-        link = ""
+    slug = _safe_slug(_clamp(payload.get("slug", ""), 96))
     market_url = _clamp(payload.get("marketUrl", ""), 256)
     if not market_url.startswith("https://"):
         market_url = ""
+    # Build the GiftTrove deep-link HERE, server-side, stamping the sharer's
+    # CURRENT referral code from our own records. We deliberately ignore any
+    # link the client sent: the client value can carry a stale code (e.g. the
+    # auto-generated base36 one) if it raced ahead of the vanity-code fetch, or
+    # simply an out-of-date cached code. The DB is the single source of truth,
+    # so a shared card always carries the user's latest (custom) code.
+    my_code = get_ref_code(uid) or ""
+    if slug:
+        link = f"{MINIAPP_URL}?startapp=g_{slug}_{my_code}" if my_code else f"{MINIAPP_URL}?startapp=g_{slug}"
+    else:
+        link = f"{MINIAPP_URL}?startapp={my_code}" if my_code else MINIAPP_URL
     _mid = " \u00b7 "
     # Count the share the moment it's initiated — a share is a share whether
     # Telegram serves the prepared card or the plain sheet.
