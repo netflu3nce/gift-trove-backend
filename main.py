@@ -3,6 +3,7 @@ GiftTrove backend — FastAPI + Telethon (MTProto user session)
 """
 
 import os
+import re
 import time
 import json
 import asyncio
@@ -16,6 +17,59 @@ from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("gifttrove")
+
+# ─── Secret redaction in logs ─────────────────────────────────────────────────
+# Credentials must never reach the logs in clear text. We snapshot the values of
+# known-sensitive env vars at startup and mask any occurrence of them in every
+# log record with ****, plus a defensive catch-all for bot-token-shaped strings
+# (e.g. 1234567890:AA...). Env vars are present in os.environ from process start,
+# so this snapshot is complete even though the typed config constants below are
+# assigned a few lines later.
+_SENSITIVE_ENV_KEYS = (
+    "BOT_TOKEN", "API_HASH", "API_ID", "STRING_SESSION", "DATABASE_URL",
+    "MARKETAPP_TOKEN", "ACCESS_CODE", "ADMIN_CODE",
+)
+_BOT_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b")
+
+class _RedactSecrets(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self._secrets = set()
+        for k in _SENSITIVE_ENV_KEYS:
+            v = (os.getenv(k, "") or "").strip()
+            if v and len(v) >= 4:
+                self._secrets.add(v)
+
+    def _mask(self, s):
+        if not isinstance(s, str):
+            return s
+        for sec in self._secrets:
+            if sec in s:
+                s = s.replace(sec, "****")
+        return _BOT_TOKEN_RE.sub("****", s)
+
+    def filter(self, record):
+        try:
+            if isinstance(record.msg, str):
+                record.msg = self._mask(record.msg)
+            if record.args:
+                if isinstance(record.args, dict):
+                    record.args = {k: self._mask(v) for k, v in record.args.items()}
+                else:
+                    record.args = tuple(self._mask(a) for a in record.args)
+        except Exception:
+            pass
+        return True
+
+# Attach to every root handler so all loggers that propagate to root (ours, and
+# uvicorn's) get redacted. Re-applied if handlers are added later.
+def _install_redaction():
+    flt = _RedactSecrets()
+    root = logging.getLogger()
+    for h in root.handlers:
+        if not any(isinstance(f, _RedactSecrets) for f in h.filters):
+            h.addFilter(flt)
+_install_redaction()
 
 try:
     from telethon import TelegramClient, functions, types, Button  # noqa: F401
@@ -49,8 +103,11 @@ GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 # The listings path + its collection query param are env-overridable so the exact
 # endpoint can be corrected from their Swagger without a code change.
 MARKETAPP_TOKEN = os.getenv("MARKETAPP_TOKEN", "")
-MARKETAPP_BASE = os.getenv("MARKETAPP_BASE", "https://api.marketapp.ws").rstrip("/")
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://gift-trove-frontend.vercel.app").split(",") if o.strip()]
+MARKETAPP_BASE = os.getenv("MARKETAPP_BASE", "https://api.marketapp.org").rstrip("/")
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://gift-trove-frontend.vercel.app,https://trovebeta.vercel.app"
+).split(",") if o.strip()]
 DB_PATH = os.getenv("DB_PATH", "gifttrove.db")
 # Durable storage: if DATABASE_URL (Postgres, e.g. Neon) is set, use it so data
 # survives redeploys. Otherwise fall back to local SQLite (ephemeral on Render).
@@ -86,7 +143,199 @@ PROMO_REPORT_HIDE = int(os.getenv("PROMO_REPORT_HIDE", "5"))     # auto-hide aft
 # they referred — but ONLY while the referrer is themselves an active Pro.
 AFFILIATE_PCT = int(os.getenv("AFFILIATE_PCT", "30"))            # % of each sub payment
 AFFILIATE_MIN_WITHDRAW = int(os.getenv("AFFILIATE_MIN_WITHDRAW", "1000"))  # Stars before payout
-STAR_TO_TON = float(os.getenv("STAR_TO_TON", "0.005"))           # ~net Fragment rate (≈200★/TON); GRAM==TON
+STAR_TO_TON = float(os.getenv("STAR_TO_TON", "0.005"))           # fallback only; live rate preferred
+# Telegram fixes the USD price of a Star — it's the TON *amount* that floats with
+# TON's market price, not the other way around. So the right fallback is a stable
+# USD-per-Star constant, not "a fixed TON ratio × live TON/USD" (that compounds
+# incorrectly as TON's price moves and was the actual bug behind cross-currency
+# ranking looking wrong). $0.015 sits in the documented range for Telegram Stars
+# (~$0.013 creator payout floor to ~$0.017-0.02 consumer purchase price). Override
+# via env if a more precise figure becomes available.
+STARS_USD_RATE = float(os.getenv("STARS_USD_RATE", "0.015"))
+USDT_PER_TON = float(os.getenv("USDT_PER_TON", "3.2"))           # fallback only; live rate preferred
+
+# ── Live TON/USD rate (Binance primary, OKX + CoinGecko fallbacks) ──────────────
+# Used for USDT→GRAM ranking and Stars→USD conversion. 2-minute cache.
+_ton_usd_cache = {"ts": 0.0, "rate": 0.0}
+_TON_USD_TTL = 120
+
+async def _ton_usd_rate():
+    now = time.time()
+    if _ton_usd_cache["rate"] > 0 and (now - _ton_usd_cache["ts"]) < _TON_USD_TTL:
+        return _ton_usd_cache["rate"]
+    rate, source = 0.0, None
+    # Primary: TonAPI — the TON ecosystem's own public indexer, built to be
+    # called from app/dApp backends, so it doesn't apply the cloud/datacenter-IP
+    # geofencing that exchange APIs (Binance especially) commonly enforce.
+    try:
+        async with httpx.AsyncClient(timeout=6) as cli:
+            r = await cli.get("https://tonapi.io/v2/rates", params={"tokens": "ton", "currencies": "usd"})
+        if r.status_code == 200:
+            rate = float((((r.json() or {}).get("rates") or {}).get("TON") or {}).get("prices", {}).get("USD") or 0)
+            if rate > 0:
+                source = "tonapi"
+    except Exception as e:
+        log.info("tonapi ton rate failed: %s", e)
+    # Binance TONUSDT spot.
+    if rate <= 0:
+        try:
+            async with httpx.AsyncClient(timeout=6) as cli:
+                r = await cli.get("https://api.binance.com/api/v3/ticker/price",
+                                  params={"symbol": "TONUSDT"})
+            if r.status_code == 200:
+                rate = float((r.json() or {}).get("price") or 0)
+                if rate > 0:
+                    source = "binance"
+        except Exception as e:
+            log.info("binance ton rate failed: %s", e)
+    # OKX.
+    if rate <= 0:
+        try:
+            async with httpx.AsyncClient(timeout=6) as cli:
+                r = await cli.get("https://www.okx.com/api/v5/market/ticker",
+                                  params={"instId": "TON-USDT"})
+            if r.status_code == 200:
+                rate = float((((r.json() or {}).get("data") or [{}])[0]).get("last") or 0)
+                if rate > 0:
+                    source = "okx"
+        except Exception as e:
+            log.info("okx ton rate failed: %s", e)
+    # Kraken — different cloud-IP policy than Binance/OKX, useful diversity.
+    if rate <= 0:
+        try:
+            async with httpx.AsyncClient(timeout=6) as cli:
+                r = await cli.get("https://api.kraken.com/0/public/Ticker", params={"pair": "TONUSD"})
+            if r.status_code == 200:
+                res = ((r.json() or {}).get("result") or {})
+                pair = next(iter(res.values()), {}) if res else {}
+                rate = float((pair.get("c") or [0])[0] or 0)
+                if rate > 0:
+                    source = "kraken"
+        except Exception as e:
+            log.info("kraken ton rate failed: %s", e)
+    # CoinGecko.
+    if rate <= 0:
+        try:
+            async with httpx.AsyncClient(timeout=6) as cli:
+                r = await cli.get("https://api.coingecko.com/api/v3/simple/price",
+                                  params={"ids": "the-open-network", "vs_currencies": "usd"})
+            if r.status_code == 200:
+                rate = float(((r.json() or {}).get("the-open-network") or {}).get("usd") or 0)
+                if rate > 0:
+                    source = "coingecko"
+        except Exception as e:
+            log.info("coingecko ton rate failed: %s", e)
+    if rate > 0:
+        _ton_usd_cache.update(ts=now, rate=rate)
+        log.info("ton/usd rate refreshed via %s: %.4f", source, rate)
+        return rate
+    # Every source failed — this should be rare and is never allowed to fail
+    # silently again, since it feeds both search ranking AND affiliate GRAM
+    # payout math. notify_admin already de-dupes identical alerts within 10 min.
+    try:
+        asyncio.create_task(notify_admin(
+            f"TON/USD live rate fetch failed on every source (tonapi, binance, okx, kraken, "
+            f"coingecko) — falling back to the static default ({USDT_PER_TON}). GRAM-based "
+            f"ranking and affiliate GRAM conversion are inaccurate until this recovers.",
+            level="warning"))
+    except Exception:
+        pass
+    return _ton_usd_cache["rate"] or USDT_PER_TON
+
+# ── Live Stars/USD rate via Telegram's official MTProto endpoint ─────────────────
+# payments.getStarsRevenueStats returns usd_rate — the official Telegram conversion
+# rate for Stars ↔ USD. This is the number that drives affiliate payouts (what
+# Telegram itself pays out per Star). Cache 4 hours — the Stars price rarely moves.
+# Falls back to the stable STARS_USD_RATE constant if the MTProto call fails.
+_stars_usd_cache = {"ts": 0.0, "rate": 0.0}
+_STARS_USD_TTL = 14400
+_stars_refresh_running = False
+
+async def _refresh_stars_usd_bg():
+    """Background task: refresh Stars/USD rate via Telegram MTProto without blocking callers.
+    Must be called via the BOT's own session asking about ITSELF (InputPeerSelf) —
+    payments.getStarsRevenueStats reports the revenue of whoever you're authenticated
+    as, so calling it via our separate user session (`client`) while passing the bot
+    as a third-party peer has no permission to succeed and silently errors every time."""
+    global _stars_refresh_running, _stars_usd_cache
+    if _stars_refresh_running:
+        return
+    _stars_refresh_running = True
+    try:
+        if bot is not None:
+            from telethon.tl.functions.payments import GetStarsRevenueStatsRequest
+            from telethon.tl.types import InputPeerSelf
+            res = await bot(GetStarsRevenueStatsRequest(peer=InputPeerSelf()))
+            if hasattr(res, "usd_rate") and res.usd_rate:
+                rate = float(res.usd_rate)
+                _stars_usd_cache.update(ts=time.time(), rate=rate)
+                log.info("stars/usd rate refreshed (official Telegram): %.6f", rate)
+    except Exception as e:
+        log.info("stars_usd MTProto bg refresh failed: %s", e)
+    finally:
+        _stars_refresh_running = False
+
+async def _stars_usd_rate():
+    """Return the best available Stars→USD rate immediately, never blocking.
+    If the cache is fresh, returns it. If stale or empty, returns the stable
+    USD-anchored fallback (STARS_USD_RATE) and kicks off a background MTProto
+    refresh so future calls get the official Telegram rate. This keeps the sort
+    path fast even during Telegram MTProto flood waits."""
+    now = time.time()
+    # Fresh cache: return immediately.
+    if _stars_usd_cache["rate"] > 0 and (now - _stars_usd_cache["ts"]) < _STARS_USD_TTL:
+        return _stars_usd_cache["rate"]
+    # Stale or empty: schedule background refresh, return best available now.
+    try:
+        asyncio.create_task(_refresh_stars_usd_bg())
+    except Exception:
+        pass
+    return _stars_usd_cache["rate"] or STARS_USD_RATE
+
+# ── Share banner: pre-upload once to get a stable Telegram file_id ──────────────
+# Using cached_photo (file already on Telegram's CDN) instead of photo_url
+# eliminates the half-loaded banner caused by Telegram re-fetching from ibb.co
+# on every single share. Re-uploads on cold start (once per Render deploy).
+_share_photo_fid = None
+
+async def _ensure_share_photo_fid():
+    """Upload SHARE_IMAGE via Bot API once per cold start, return the file_id."""
+    global _share_photo_fid
+    if _share_photo_fid:
+        return _share_photo_fid
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = await _bot_api("sendPhoto", {
+                "chat_id": int(ANALYTICS_ADMIN_ID),
+                "photo": SHARE_IMAGE,
+                "disable_notification": True,
+                "caption": "share banner (internal cache)",
+            })
+            if resp and resp.get("ok"):
+                photos = (resp.get("result") or {}).get("photo") or []
+                fid = photos[-1]["file_id"] if photos else None
+                if fid:
+                    _share_photo_fid = fid
+                    log.info("share banner uploaded, file_id cached: %s…", fid[:24])
+                    return fid
+            last_err = resp
+        except Exception as e:
+            last_err = e
+        if attempt == 0:
+            await asyncio.sleep(1.0)
+    # Both attempts failed — shares will still go out via the article fallback
+    # (clean text + links, no image), but this should never be silent: it's
+    # the difference between a share looking right and looking half-finished.
+    log.info("share banner upload failed: %s", last_err)
+    try:
+        await notify_admin(
+            f"Share banner upload failed twice — shares are falling back to the "
+            f"no-image article format until this recovers. Last error: {last_err}",
+            level="warning")
+    except Exception:
+        pass
+    return None
 
 # ─── Access gate ──────────────────────────────────────────────────────────────
 # Admins bypass automatically; everyone else needs the access code. BOTH live in
@@ -108,7 +357,9 @@ FRAGMENT_CDN = "https://nft.fragment.com/gift"
 
 # ─── Bot (/start handler) ─────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-WELCOME_IMAGE = os.getenv("WELCOME_IMAGE", "https://i.ibb.co/5Xmf7H6b/Inria-Serif-1.png")
+WELCOME_IMAGE = os.getenv("WELCOME_IMAGE", "https://i.ibb.co/ksyP8tjh/Gift-Trove-Telegram-Gifts-Landing-1.png")
+# Banner attached to every shared-gift inline message.
+SHARE_IMAGE = os.getenv("SHARE_IMAGE", "https://i.ibb.co/4g4s6vxj/6-EC6-BD64-4686-4115-A8-A5-CE9-E12-F65-C8-B.png")
 
 # Premium custom-emoji ids (rendered in the bot's own messages via HTML).
 EMOJI_USER = "5974038293120027938"     # 👤  (start, spot 1)
@@ -126,17 +377,21 @@ MARKET_EMOJI = {
 
 WELCOME_HTML = os.getenv(
     "WELCOME_HTML",
-    f'<emoji document-id={EMOJI_USER}>\U0001f464</emoji> <b>Welcome to GiftTrove! Scout unique '
-    f'Telegram gifts from different marketplaces all at a go.</b>\n\n'
-    f'<b>GiftTrove</b> <emoji document-id={EMOJI_SEARCH}>\U0001f50e</emoji>',
+    "<b>Welcome to GiftTrove! Scout unique Telegram gifts from different "
+    "marketplaces all at a go. \u2726</b>",
 )
-# Plain fallback if custom emoji can't be sent (still friendly).
+# Plain fallback if formatting can't be sent (still friendly).
 WELCOME_PLAIN = (
     "Welcome to GiftTrove! Scout unique Telegram gifts from different "
-    "marketplaces all at a go.\n\nGiftTrove"
+    "marketplaces all at a go. \u2726"
 )
 MINIAPP_URL = os.getenv("MINIAPP_URL", "https://t.me/gifttrovebot/app")
 COMMUNITY_URL = os.getenv("COMMUNITY_URL", "https://t.me/gifttrove")
+# Hoton (cheaper Stars) referral — used in the "insufficient balance" DM and the
+# in-app "Need Stars?" CTA. Keep this in sync with the frontend link.
+HOTON_URL = os.getenv(
+    "HOTON_URL",
+    "https://t.me/hotontgbot/app?startapp=UQBRBt4DBvWYNqP9_p9-nysR55R2PXz9BEZjvrxiPWvVBcJO")
 
 FEATURED_NAMES = [n.strip() for n in os.getenv(
     "FEATURED_NAMES", "Plush Pepe,Durov's Cap,Heart Locket").split(",") if n.strip()]
@@ -327,15 +582,34 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_refcode_code ON ref_codes(code);")
         # Active Stars subscriptions. tier in (plus,pro); expires_at is the unix time
         # the current paid period ends — lapses to free automatically when passed.
+        # cancelled=1 once the member cancels in-app (so a later lapse isn't mistaken
+        # for a failed renewal). end_notified=1 once we've sent the lapse DM.
         conn.execute(
             """CREATE TABLE IF NOT EXISTS subs (
                    uid TEXT PRIMARY KEY,
                    tier TEXT NOT NULL,
                    expires_at INTEGER NOT NULL,
                    charge_id TEXT,
-                   ts INTEGER NOT NULL)"""
+                   ts INTEGER NOT NULL,
+                   cancelled INTEGER DEFAULT 0,
+                   end_notified INTEGER DEFAULT 0)"""
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_subs_exp ON subs(expires_at);")
+        _have_subs = _existing_columns(conn, "subs")
+        for _col, _typ in (("cancelled", "INTEGER DEFAULT 0"), ("end_notified", "INTEGER DEFAULT 0"),
+                           ("tag_cleared", "INTEGER DEFAULT 0")):
+            if _col not in _have_subs:
+                conn.execute(f"ALTER TABLE subs ADD COLUMN {_col} {_typ}")
+
+        # Per-user language for bot DMs ('en' | 'ru' | 'zh'). Driven by the in-app
+        # language switcher (synced via /api/lang) and seeded from the user's
+        # Telegram language on /start. Defaults to English when unknown.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS user_lang (
+                   uid TEXT PRIMARY KEY,
+                   lang TEXT NOT NULL DEFAULT 'en',
+                   ts INTEGER NOT NULL)"""
+        )
         # Promoted gifts. One paid promotion = one row. status: pending|active|removed.
         conn.execute(
             """CREATE TABLE IF NOT EXISTS promos (
@@ -679,6 +953,20 @@ def _sub_row(uid):
         pass
     return None
 
+def _sub_full(uid):
+    """Raw current subs row as (tier, expires_at, charge_id), ignoring expiry.
+    Used to tell a first activation from an auto-renewal or a tier switch."""
+    if not uid:
+        return None
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT tier, expires_at, charge_id FROM subs WHERE uid=?", (str(uid),)).fetchone()
+        if row:
+            return (row["tier"], int(row["expires_at"] or 0), row["charge_id"])
+    except Exception:
+        pass
+    return None
+
 # A vanity code must look like a code, not impersonate a number that resolve_ref
 # would read as a raw uid, so we require at least one letter.
 _VANITY_RE = _re.compile(r"^[A-Z0-9]{5,12}$")
@@ -996,16 +1284,131 @@ def _affiliate_stats(uid):
     return out
 
 def _affiliate_request_payout(uid, stars, ton_address):
+    """Create a payout request and return its id (or None on failure)."""
+    pid = _secrets.token_hex(8)
     try:
         with db() as conn:
             conn.execute(
                 "INSERT INTO affiliate_payouts(id, uid, stars, ton_address, status, ts) VALUES(?,?,?,?,?,?)",
-                (_secrets.token_hex(8), str(uid), int(stars), ton_address or "", "requested", int(time.time())))
+                (pid, str(uid), int(stars), ton_address or "", "requested", int(time.time())))
+            conn.commit()
+        return pid
+    except Exception as e:
+        log.error("affiliate payout request failed: %s", e)
+        return None
+
+def _affiliate_payout_get(pid):
+    """Fetch a single payout request row as a dict (or None)."""
+    try:
+        with db() as conn:
+            r = conn.execute(
+                "SELECT id, uid, stars, ton_address, status, ts FROM affiliate_payouts WHERE id=?",
+                (str(pid),)).fetchone()
+        return dict(r) if r else None
+    except Exception:
+        return None
+
+def _affiliate_payout_set_status(pid, status):
+    try:
+        with db() as conn:
+            conn.execute("UPDATE affiliate_payouts SET status=? WHERE id=?", (status, str(pid)))
             conn.commit()
         return True
     except Exception as e:
-        log.error("affiliate payout request failed: %s", e)
+        log.error("payout status update failed: %s", e)
         return False
+
+async def _gram_from_stars(stars):
+    """Convert a Stars amount to GRAM using the SAME live rate as search ranking
+    (Stars->USD via _stars_usd_rate, USD->GRAM via the live TON/USD rate) — not
+    the old static STAR_TO_TON placeholder, which drifted from real market value
+    and disagreed with what listings actually rank at. Logged so the rate behind
+    any given payout is always visible after the fact, not just inferred."""
+    try:
+        stars = int(stars)
+        if stars <= 0:
+            return 0
+        usd_rate = await _stars_usd_rate()
+        ton_usd = await _ton_usd_rate()
+        gram = round((stars * usd_rate) / ton_usd, 2) if ton_usd else 0
+        log.info("gram_from_stars: stars=%d stars_usd=%.6f ton_usd=%.4f -> gram=%.2f",
+                  stars, usd_rate, ton_usd, gram)
+        return gram
+    except Exception as e:
+        log.info("_gram_from_stars error: %s", e)
+        return 0
+
+async def _fmt_gram(stars):
+    """Pretty GRAM string: drops a trailing .0 (e.g. 5 not 5.0; 5.25 stays)."""
+    g = await _gram_from_stars(stars)
+    return str(int(g)) if float(g).is_integer() else f"{g:g}"
+
+
+def _user_authenticity(uid):
+    """Heuristic authenticity report for a member, used by the admin scanner before
+    approving a payout. These are SIGNALS, not proof — the verdict is advisory and
+    should be sanity-checked, not blindly trusted."""
+    uid = str(uid)
+    now = int(time.time())
+    s = _affiliate_stats(uid)
+    out = {
+        "uid": uid, "stats": s, "tier": get_tier(uid),
+        "referrer": _referrer_of(uid), "member": {},
+        "referrals_total": s.get("referees", 0), "paid_referrals": s.get("payers", 0),
+        "payouts": _affiliate_payouts(uid, limit=20), "flags": [], "authentic": True,
+    }
+    # Member activity (the members table is hashed, so look up by hash).
+    try:
+        h = _uid_hash(uid)
+        with db() as conn:
+            m = conn.execute("SELECT first_seen, last_seen, visits FROM members WHERE uid_hash=?", (h,)).fetchone()
+        if m:
+            fs = int(m["first_seen"]); ls = int(m["last_seen"]); v = int(m["visits"])
+            out["member"] = {"first_seen": fs, "last_seen": ls, "visits": v,
+                             "age_days": max(0, (now - fs) // 86400), "seen_app": True}
+        else:
+            out["member"] = {"seen_app": False}
+    except Exception:
+        out["member"] = {}
+    # Referral timestamps for velocity / burst detection.
+    ref_ts = []
+    try:
+        with db() as conn:
+            rows = conn.execute("SELECT ts FROM referrals WHERE referred_by=? ORDER BY ts ASC", (uid,)).fetchall()
+        ref_ts = [int(r["ts"]) for r in rows]
+    except Exception:
+        ref_ts = []
+    burst, j = 0, 0
+    for i in range(len(ref_ts)):              # max referrals in any rolling 1-hour window
+        while ref_ts[i] - ref_ts[j] > 3600:
+            j += 1
+        burst = max(burst, i - j + 1)
+    out["max_referrals_per_hour"] = burst
+    referees = s.get("referees", 0); payers = s.get("payers", 0)
+    conv = (payers / referees) if referees else 0.0
+    out["conversion"] = round(conv, 3)
+    flags = []
+    if out["referrer"] and str(out["referrer"]) == uid:
+        flags.append({"code": "self_referral", "label": "Self-referral",
+                      "detail": "This account is recorded as its own referrer."})
+    if not out["member"].get("seen_app", False) and s.get("earned", 0) > 0:
+        flags.append({"code": "no_app_activity", "label": "No app activity",
+                      "detail": "Has commission earnings but never opened the mini app."})
+    if burst >= 8:
+        flags.append({"code": "rapid_referrals", "label": "Rapid referrals",
+                      "detail": f"{burst} referrals arrived within a single hour."})
+    if referees >= 10 and conv < 0.05:
+        flags.append({"code": "low_conversion", "label": "Very low conversion",
+                      "detail": f"{payers}/{referees} referred members ever paid ({out['conversion']*100:.0f}%)."})
+    elif referees >= 5 and payers == 0:
+        flags.append({"code": "no_conversions", "label": "No conversions",
+                      "detail": f"{referees} referrals but none have paid for a plan."})
+    out["flags"] = flags
+    out["authentic"] = len(flags) == 0
+    high_risk = any(f["code"] in ("self_referral", "no_app_activity") for f in flags)
+    out["verdict"] = ("Looks authentic" if out["authentic"]
+                      else ("High risk" if high_risk else "Needs review"))
+    return out
 
 def _affiliate_payouts(uid, limit=20):
     try:
@@ -1100,6 +1503,46 @@ def _digits(s, maxlen=20):
     return s if s.isdigit() and 0 < len(s) <= maxlen else ""
 
 
+# ─── Anti-scraping guard for the high-value data endpoints ────────────────────
+# No captchas. The gate is Telegram's own cryptography: every Mini App session
+# carries HMAC-signed initData (verified against BOT_TOKEN, max 24h old). A
+# scraper can rotate IPs and spoof uids all day — it cannot mint a valid
+# signature without actually opening the Mini App from a real Telegram account,
+# and each such identity is then individually rate-limited. Off-switch via env
+# (REQUIRE_SIGNED_API=0) for local dev outside Telegram.
+REQUIRE_SIGNED_API = os.getenv("REQUIRE_SIGNED_API", "1") == "1"
+_BOT_UA_RX = _re.compile(
+    r"(python-requests|python-httpx|python-urllib|aiohttp|curl/|wget/|scrapy|"
+    r"go-http-client|node-fetch|axios/|okhttp|libwww|java/|httpclient|postman)", _re.I)
+
+
+def _client_ip(request):
+    try:
+        return (request.headers.get("x-forwarded-for", "") or
+                (request.client.host if request.client else "")).split(",")[0].strip() or "?"
+    except Exception:
+        return "?"
+
+
+def _data_guard(request, x_init_data):
+    """Gate for /api/search, /api/attributes and /api/gift. Returns
+    (verified_uid, None) for a legitimate Telegram Mini App session, or
+    (None, JSONResponse) to reject. The empty-shape body keeps every client
+    code path safe regardless of which endpoint rejected."""
+    _reject_body = {"error": "telegram_only", "results": [],
+                    "models": [], "symbols": [], "backdrops": []}
+    try:
+        ua = (request.headers.get("user-agent") or "") if request is not None else ""
+    except Exception:
+        ua = ""
+    if ua and _BOT_UA_RX.search(ua):
+        return None, JSONResponse(status_code=403, content=dict(_reject_body, error="automated_client"))
+    vuid = verify_init_data(x_init_data)
+    if REQUIRE_SIGNED_API and not vuid:
+        return None, JSONResponse(status_code=401, content=_reject_body)
+    return vuid, None
+
+
 def _safe_slug(s):
     s = str(s or "").strip()
     return s if _SLUG_RE.match(s) else ""
@@ -1123,31 +1566,191 @@ def _gift_label(name, num):
     return f"{nm} #{n}" if n else nm
 
 
-async def _dm(uid, text, bold_ranges=None):
-    """Send a plain DM to a user, optionally bolding given (start,len) char ranges.
-    Bold is applied via MTProto entities (so it renders) with a graceful fallback
-    to a plain Bot API message. bold_ranges are in PYTHON string indices; we
-    convert to UTF-16 units that Telegram entities require."""
+# Leading glyph for every informational DM (a circled "i" — a typographic symbol,
+# not a colour emoji, so it renders identically everywhere).
+INFO = "\u24d8 "
+
+
+def _gift_url_for(slug="", num="", link="", mkt=""):
+    """Best public link for a promoted gift. Telegram-native gifts get the exact
+    t.me/nft link; otherwise we fall back to whatever marketplace link we stored."""
+    slug = (slug or "").strip()
+    num = str(num or "").strip()
+    if slug and num:
+        return f"https://t.me/nft/{slug}-{num}"
+    return (link or "").strip()
+
+
+def _promo_label_link(coll, num, slug="", link="", mkt=""):
+    """Returns (label, url) where label is the readable 'Name #id' shown to the
+    user and url is the exact t.me gift link it should point to."""
+    return _gift_label(coll, num), _gift_url_for(slug, num, link, mkt)
+
+
+# ─── Localization ────────────────────────────────────────────────────────────
+# Every user-facing bot DM is available in English, Russian and Chinese. The
+# language is chosen per user (in-app switcher synced via /api/lang, seeded from
+# the user's Telegram language on /start). Brand terms — "scout+", "scout pro",
+# "hoton", "GRAM", @handles — stay as-is in all languages. Templates DO NOT carry
+# the leading "ⓘ " (the sender prepends INFO) so the gift-label hyperlink always
+# starts at offset len(INFO).
+def _norm_lang(code):
+    c = (code or "").strip().lower()
+    if c.startswith("ru"):
+        return "ru"
+    if c.startswith("zh"):
+        return "zh"
+    if c in ("en", "ru", "zh"):
+        return c
+    return "en"
+
+def _user_lang(uid):
+    try:
+        with db() as conn:
+            r = conn.execute("SELECT lang FROM user_lang WHERE uid=?", (str(uid),)).fetchone()
+        if r and r["lang"] in ("en", "ru", "zh"):
+            return r["lang"]
+    except Exception:
+        pass
+    return "en"
+
+def _set_user_lang(uid, lang):
+    lang = _norm_lang(lang)
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM user_lang WHERE uid=?", (str(uid),))
+            conn.execute("INSERT INTO user_lang(uid, lang, ts) VALUES(?,?,?)",
+                         (str(uid), lang, int(time.time())))
+            conn.commit()
+        return True
+    except Exception as e:
+        log.info("set user lang failed: %s", e)
+        return False
+
+def _t(key, lang):
+    d = TR.get(key, {})
+    return d.get(lang) or d.get("en") or ""
+
+TR = {
+    "sub_plus": {
+        "en": "your GiftTrove scout+ subscription is now active. you can now \n\n\u203a apply up to 7 filters each ",
+        "ru": "ваша подписка GiftTrove scout+ теперь активна. теперь вы можете \n\n\u203a применять до 7 фильтров каждого вида ",
+        "zh": "您的 GiftTrove scout+ 订阅现已激活。现在您可以 \n\n\u203a 每种最多使用 7 个筛选条件 ",
+    },
+    "sub_pro": {
+        "en": "your GiftTrove scout pro subscription is now active. you can now \n\n\u203a scout with unlimited filters \n\u203a get customized invite code\n\u203a access to affiliate program\n\u203a no promoted gifts in your scouts",
+        "ru": "ваша подписка GiftTrove scout pro теперь активна. теперь вы можете \n\n\u203a искать без ограничений по фильтрам \n\u203a получить персональный пригласительный код\n\u203a доступ к партнёрской программе\n\u203a без рекламируемых подарков в результатах",
+        "zh": "您的 GiftTrove scout pro 订阅现已激活。现在您可以 \n\n\u203a 使用无限筛选条件侦测 \n\u203a 获取专属邀请码\n\u203a 使用推广联盟计划\n\u203a 侦测结果中不含推广礼物",
+    },
+    "sub_renewed": {
+        "en": "your {plan} subscription has been renewed automatically\n\nkeep scouting.",
+        "ru": "ваша подписка {plan} была автоматически продлена\n\nпродолжайте искать.",
+        "zh": "您的 {plan} 订阅已自动续订\n\n继续侦测吧。",
+    },
+    "sub_insufficient": {
+        "en": "your {plan} subscription has been ended due to insufficient star balance\u2026 \n\ndeposit stars with hoton to keep your premium running",
+        "ru": "ваша подписка {plan} завершена из-за недостатка звёзд\u2026 \n\nпополните звёзды через hoton, чтобы сохранить премиум",
+        "zh": "由于星星余额不足，您的 {plan} 订阅已结束\u2026 \n\n通过 hoton 充值星星以保持会员有效",
+    },
+    "sub_cancel": {
+        "en": "your {plan} plan has been cancelled. if this wasn't a mistake ensure you confirm in telegram to verify it's been truly cancelled to avoid extra billings \n\ntelegram \u2192 settings \u2192 my stars \u2192 confirm",
+        "ru": "ваш план {plan} был отменён. если это не ошибка, подтвердите отмену в telegram, чтобы избежать повторных списаний \n\ntelegram \u2192 настройки \u2192 мои звёзды \u2192 подтвердить",
+        "zh": "您的 {plan} 套餐已取消。如果这不是误操作，请在 telegram 中确认取消，以避免额外扣费 \n\ntelegram \u2192 设置 \u2192 我的星星 \u2192 确认",
+    },
+    "promo_live": {
+        "en": "{label} is live for {days} days. \n\nyou'd be notified if your gift promotion has been sold or when the promotion ends.",
+        "ru": "{label} рекламируется {days} дн. \n\nвы получите уведомление, если ваш подарок будет продан или когда продвижение завершится.",
+        "zh": "{label} 已上线推广 {days} 天。\n\n当您推广的礼物被售出或推广结束时，您会收到通知。",
+    },
+    "promo_notfound": {
+        "en": "{label} couldn't be found. \n\nkindly cross check if you inputted the wrong ID or gift isn't listed for sale.",
+        "ru": "{label} не найден. \n\nпожалуйста, проверьте, не ошиблись ли вы в ID или подарок не выставлен на продажу.",
+        "zh": "找不到 {label}。\n\n请检查您是否输入了错误的 ID，或该礼物未上架出售。",
+    },
+    "promo_bought": {
+        "en": "{label} has been purchased. \n\ncongratulations\u2026 you're always welcome to promote with GiftTrove.",
+        "ru": "{label} был куплен. \n\nпоздравляем\u2026 будем рады снова видеть вас в продвижении с GiftTrove.",
+        "zh": "{label} 已被购买。\n\n恭喜\u2026 欢迎随时再次通过 GiftTrove 推广。",
+    },
+    "promo_ended": {
+        "en": "{label} promotion has ended and not purchased. \n\nyou can consider making some changes with your listing and try again.",
+        "ru": "продвижение {label} завершилось без покупки. \n\nвы можете изменить параметры объявления и попробовать снова.",
+        "zh": "{label} 的推广已结束且未被购买。\n\n您可以考虑调整挂单后再试一次。",
+    },
+    "payout_review": {
+        "en": "your payout request of {gram} GRAM is on review by an admin\n\nwe are working towards automatic payout soon\u2026 feel free to reach out to @asktrove if the payout is taking too long",
+        "ru": "ваш запрос на выплату {gram} GRAM проверяется администратором\n\nмы скоро добавим автоматические выплаты\u2026 если выплата задерживается, напишите @asktrove",
+        "zh": "您的 {gram} GRAM 提现申请正在由管理员审核\n\n我们即将推出自动提现\u2026 如果提现耗时过长，请联系 @asktrove",
+    },
+    "payout_credited": {
+        "en": "congratulations, {gram} GRAM has been credited to {addr} \n\nkeep earning with @gifttrove {when}",
+        "ru": "поздравляем, {gram} GRAM зачислено на {addr} \n\nпродолжайте зарабатывать с @gifttrove {when}",
+        "zh": "恭喜，{gram} GRAM 已发放至 {addr} \n\n继续通过 @gifttrove 赚取收益 {when}",
+    },
+    "payout_declined": {
+        "en": "your payout request has been declined for possible reasons which might include fake or gaming the system\n\nfeel free to reach out to @asktrove to request a review",
+        "ru": "ваш запрос на выплату отклонён по возможным причинам, включая мошенничество или попытки обмануть систему\n\nнапишите @asktrove, чтобы запросить пересмотр",
+        "zh": "您的提现申请已被拒绝，可能原因包括作弊或滥用系统\n\n如需复核，请联系 @asktrove",
+    },
+    "welcome": {
+        "en": "Welcome to GiftTrove! Scout unique Telegram gifts from different marketplaces all at a go. \u2726",
+        "ru": "Добро пожаловать в GiftTrove! Ищите уникальные подарки Telegram сразу с нескольких маркетплейсов. \u2726",
+        "zh": "欢迎使用 GiftTrove！一次性从多个市场侦测独特的 Telegram 礼物。\u2726",
+    },
+    "share_hey": {
+        "en": "Hey! Check out ",
+        "ru": "Привет! Зацени ",
+        "zh": "嘿！来看看 ",
+    },
+    "share_scout": {
+        "en": "Scout unique Telegram gifts on GiftTrove",
+        "ru": "Ищите уникальные подарки Telegram в GiftTrove",
+        "zh": "在 GiftTrove 上侦测独特的 Telegram 礼物",
+    },
+    "share_open": {
+        "en": "Open in GiftTrove",
+        "ru": "Открыть в GiftTrove",
+        "zh": "在 GiftTrove 中打开",
+    },
+}
+
+
+async def _dm(uid, text, bold_ranges=None, code_ranges=None, link_ranges=None):
+    """Send a plain DM to a user with optional rich entities:
+      - bold_ranges:  list of (start, len)         -> bold
+      - code_ranges:  list of (start, len)         -> monospace (code)
+      - link_ranges:  list of (start, len, url)    -> tappable text link
+    All offsets are PYTHON string indices; we convert to the UTF-16 units that
+    Telegram entities require. Falls back to a plain Bot API message if entity
+    sending isn't possible."""
     if not uid:
         return False
     txt = str(text or "")
-    if bot is not None and bold_ranges:
+    has_rich = bool(bold_ranges or code_ranges or link_ranges)
+    if bot is not None and has_rich:
         try:
-            from telethon.tl.types import MessageEntityBold
+            from telethon.tl.types import (
+                MessageEntityBold, MessageEntityCode, MessageEntityTextUrl)
             def _u16(s):
                 return len(s.encode("utf-16-le")) // 2
             ents = []
-            for start, length in bold_ranges:
+            for start, length in (bold_ranges or []):
                 if start < 0 or length <= 0 or start + length > len(txt):
                     continue
-                off = _u16(txt[:start])
-                ln = _u16(txt[start:start + length])
-                ents.append(MessageEntityBold(off, ln))
+                ents.append(MessageEntityBold(_u16(txt[:start]), _u16(txt[start:start + length])))
+            for start, length in (code_ranges or []):
+                if start < 0 or length <= 0 or start + length > len(txt):
+                    continue
+                ents.append(MessageEntityCode(_u16(txt[:start]), _u16(txt[start:start + length])))
+            for start, length, url in (link_ranges or []):
+                if start < 0 or length <= 0 or start + length > len(txt) or not url:
+                    continue
+                ents.append(MessageEntityTextUrl(_u16(txt[:start]), _u16(txt[start:start + length]), url))
             if ents:
                 await bot.send_message(int(uid), txt, formatting_entities=ents)
                 return True
         except Exception as e:
-            log.info("_dm bold send failed, falling back to plain: %s", e)
+            log.info("_dm rich send failed, falling back to plain: %s", e)
     try:
         await _bot_api("sendMessage", {"chat_id": int(uid), "text": txt})
         return True
@@ -1413,50 +2016,51 @@ async def _register_bot_handlers():
         return
     from telethon import events, Button
 
+    @bot.on(events.ChatAction(chats=COMMUNITY_GROUP_IDS))
+    async def _on_community_join(event):
+        # Someone joined one of the community chats — if they're an active
+        # plus/pro subscriber (e.g. they upgraded before ever joining), tag
+        # them right away instead of waiting for their next renewal event.
+        if not event.user_joined and not event.user_added:
+            return
+        try:
+            uid = str(event.user_id)
+        except Exception:
+            return
+        tier = get_tier(uid)
+        if tier in ("plus", "pro"):
+            await _set_member_tag(uid, tier)
+
     @bot.on(events.NewMessage(pattern=r"^/start"))
     async def _start(event):
-        buttons = [
-            [Button.url("Open GiftTrove", MINIAPP_URL)],
-            [Button.url("Join Community", COMMUNITY_URL)],
-        ]
-        # Build the message with explicit entities so the PREMIUM custom emoji
-        # render (the bot may use them because the owner has Telegram Premium).
-        from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityBold
-
-        def u16(s):
-            return len(s.encode("utf-16-le")) // 2
-
-        segs = [
-            ("emoji", "\U0001f464", EMOJI_USER),
-            ("text", " "),
-            ("bold", "Welcome to GiftTrove! Scout unique Telegram gifts from different marketplaces all at a go."),
-            ("text", "\n\n"),
-            ("bold", "GiftTrove"),
-            ("text", " "),
-            ("emoji", "\U0001f50e", EMOJI_SEARCH),
-        ]
-        text, off, ents = "", 0, []
-        for kind, *rest in segs:
-            s = rest[0]
-            ln = u16(s)
-            if kind == "emoji":
-                ents.append(MessageEntityCustomEmoji(off, ln, int(rest[1])))
-            elif kind == "bold":
-                ents.append(MessageEntityBold(off, ln))
-            text += s
-            off += ln
+        # Seed the user's language from their Telegram client (the in-app switcher
+        # can override it later via /api/lang). Then reply in that language.
+        lang = "en"
         try:
-            await event.respond(text, file=WELCOME_IMAGE, buttons=buttons, formatting_entities=ents)
+            sender = await event.get_sender()
+            lang = _norm_lang(getattr(sender, "lang_code", None))
+            if event.sender_id:
+                _set_user_lang(event.sender_id, lang)
+        except Exception:
+            lang = "en"
+        labels = {
+            "open": {"en": "Open GiftTrove", "ru": "Открыть GiftTrove", "zh": "打开 GiftTrove"},
+            "community": {"en": "Join Community", "ru": "Сообщество", "zh": "加入社区"},
+        }
+        buttons = [
+            [Button.url(labels["open"].get(lang, labels["open"]["en"]), MINIAPP_URL)],
+            [Button.url(labels["community"].get(lang, labels["community"]["en"]), COMMUNITY_URL)],
+        ]
+        # Plain text (no bold), localized, with the landing image.
+        text = _t("welcome", lang)
+        try:
+            await event.respond(text, file=WELCOME_IMAGE, buttons=buttons)
         except Exception as e:
-            log.error("/start (custom emoji) failed: %s", e)
+            log.error("/start failed: %s", e)
             try:
-                await event.respond(WELCOME_PLAIN, file=WELCOME_IMAGE, buttons=buttons)
+                await event.respond(text, buttons=buttons)
             except Exception as e2:
                 log.error("/start fallback failed: %s", e2)
-                try:
-                    await event.respond(WELCOME_PLAIN)
-                except Exception:
-                    pass
 
     # ── Inline scouting: @gifttrovebot <query> — works in any DM / group ─────
     # Grammar (see _parse_inline_query):
@@ -1469,6 +2073,17 @@ async def _register_bot_handlers():
     # they stay within Telegram's tight inline latency budget.
     @bot.on(events.InlineQuery)
     async def _inline(event):
+        # Inline mode (the "@gifttrovebot …" search in groups & DMs) is disabled
+        # for now — planned for a later update. We return an empty result set so
+        # the picker shows nothing instead of erroring. Also turn Inline Mode OFF
+        # in @BotFather (/mybots → Bot Settings → Inline Mode → Turn off) so the
+        # bot stops advertising inline search in the first place.
+        try:
+            await event.answer([])
+        except Exception:
+            pass
+        return
+        # ── legacy inline implementation kept below for the future re-enable ──
         q = (event.text or "").strip()
         sender_uid = str(getattr(event, "sender_id", "") or "")
         cols = cache_get("collections") or []
@@ -1662,6 +2277,53 @@ async def _register_bot_handlers():
                 pass
         await event.answer("Done.")
 
+    # ── Affiliate payout review (admin Approve / Decline buttons) ─────────────
+    @bot.on(events.CallbackQuery(pattern=b"^aff(approve|decline):"))
+    async def _payout_review(event):
+        if str(event.sender_id) not in ADMIN_IDS:
+            await event.answer("Not allowed.", alert=True)
+            return
+        data = event.data.decode()
+        act, pid = data.split(":", 1)
+        payout = _affiliate_payout_get(pid)
+        if not payout:
+            await event.answer("Request not found.", alert=True)
+            return
+        if (payout.get("status") or "") != "requested":
+            await event.answer("Already handled.", alert=True)
+            try:
+                await event.edit(f"Already {payout.get('status')}.")
+            except Exception:
+                pass
+            return
+        uid = payout["uid"]
+        stars = int(payout.get("stars") or 0)
+        addr = payout.get("ton_address") or ""
+        gram = await _fmt_gram(stars)
+        if act == "affapprove":
+            _affiliate_payout_set_status(pid, "paid")
+            try:
+                await _send_payout_credited(uid, stars, addr)
+            except Exception as e:
+                log.info("payout credited DM failed: %s", e)
+            try:
+                await event.edit(f"Approved \u2014 {gram} GRAM ({stars}\u2605) marked paid to\n{addr}")
+            except Exception:
+                pass
+        else:
+            # Decline releases the held amount back to 'available' (it's no longer
+            # counted as pending), so the member keeps their balance.
+            _affiliate_payout_set_status(pid, "rejected")
+            try:
+                await _send_payout_declined(uid)
+            except Exception as e:
+                log.info("payout declined DM failed: %s", e)
+            try:
+                await event.edit(f"Declined \u2014 {gram} GRAM returned to the member's balance.")
+            except Exception:
+                pass
+        await event.answer("Done.")
+
     # ── Stars payments ──────────────────────────────────────────────────────
     # Invoices are created via the Bot API (createInvoiceLink), but the resulting
     # updates flow to this MTProto bot. We must approve the pre-checkout within
@@ -1704,18 +2366,20 @@ async def _record_payment(action):
         pass
     if kind == "sub" and len(parts) >= 3:
         tier, uid = parts[1], parts[2]
+        now0 = int(time.time())
+        # Snapshot the prior subscription BEFORE we overwrite it, so we can tell a
+        # first activation from an auto-renewal from a tier switch.
+        old = _sub_full(uid)            # (old_tier, old_expires_at, old_charge) or None
         # If they're switching tiers (e.g. Scout+ -> Scout Pro), cancel the OLD
-        # subscription so Telegram doesn't keep charging for both. We stored the
-        # old charge_id; botCancelStarsSubscription stops its auto-renewal.
+        # subscription so Telegram doesn't keep charging for both.
         try:
-            prev = _sub_row(uid)
-            if prev and prev[0] != tier and prev[1] and bot is not None:
+            if old and old[0] != tier and old[2] and bot is not None:
                 from telethon.tl import functions as _fn
                 try:
                     peer = await bot.get_input_entity(int(uid))
                     await bot(_fn.payments.BotCancelStarsSubscriptionRequest(
-                        user_id=peer, charge_id=prev[1]))
-                    log.info("cancelled old %s subscription for %s on tier change", prev[0], uid)
+                        user_id=peer, charge_id=old[2]))
+                    log.info("cancelled old %s subscription for %s on tier change", old[0], uid)
                 except Exception as e:
                     log.warning("old-sub auto-cancel failed (uid=%s): %s", uid, e)
         except Exception:
@@ -1730,6 +2394,13 @@ async def _record_payment(action):
             expires = int(time.time()) + SUB_PERIOD
         _sub_set(uid, tier, expires, charge_id)
         log.info("Stars subscription active: uid=%s tier=%s until=%s", uid, tier, expires)
+        # Reflect the new tier as a community-chat member tag (Scout+ / Scout Pro).
+        # Fire-and-forget: this is a courtesy badge, never something a payment
+        # confirmation should wait on or fail over.
+        try:
+            asyncio.create_task(_set_member_tag(uid, tier))
+        except Exception:
+            pass
         # Affiliate: pay the referrer a recurring cut — but only while THEY are Pro.
         try:
             ref = _referrer_of(uid)
@@ -1739,15 +2410,15 @@ async def _record_payment(action):
                 _affiliate_credit(ref, uid, tier, cut, charge_id)
         except Exception as e:
             log.info("affiliate credit skipped: %s", e)
-        # Detect a plan change (had a different active tier before) so the
-        # confirmation can remind them to cancel the previous subscription.
-        switched_from = ""
-        try:
-            if prev and prev[0] and prev[0] != tier:
-                switched_from = prev[0]
-        except Exception:
-            switched_from = ""
-        await _send_sub_confirmation(uid, tier, switched_from=switched_from)
+        # Renewal = the SAME tier was active (or only just lapsed within ~2 days)
+        # and Telegram auto-charged it again. Otherwise it's a first activation or
+        # a switch — both get the "now active" welcome.
+        is_renewal = bool(old and old[0] == tier and int(old[1] or 0) > (now0 - 2 * 86400))
+        switched_from = old[0] if (old and old[0] and old[0] != tier and int(old[1] or 0) > now0) else ""
+        if is_renewal:
+            await _send_sub_renewed(uid, tier)
+        else:
+            await _send_sub_confirmation(uid, tier, switched_from=switched_from)
     elif kind == "promo" and len(parts) >= 3:
         pid, uid = parts[1], parts[2]
         _promo_set_charge(pid, charge_id)
@@ -1777,14 +2448,8 @@ async def _record_payment(action):
             exp = _promo_activate(pid, uid, charge_id)
             log.info("promotion active: id=%s uid=%s mkt=%s num=%s until=%s", pid, uid, mkt, num, exp)
             try:
-                gift_url = fetch.get("url") or (
-                    f"https://t.me/nft/{slug}-{num}" if slug and num else
-                    "https://marketapp.ws/" if mkt == "MarketApp" else "")
-                label = _gift_label(coll_name, num)
-                msg = f"{label} is live for {PROMO_DAYS} days and will appear at the top of matching scouts."
-                if gift_url:
-                    msg += f"\n{gift_url}"
-                await _dm(uid, msg, bold_ranges=[(0, len(label))])
+                label, gift_url = _promo_label_link(coll_name, num, slug, fetch.get("url") or promo.get("link"), mkt)
+                await _send_promo_live(uid, label, gift_url, PROMO_DAYS)
             except Exception:
                 pass
         else:
@@ -1796,10 +2461,8 @@ async def _record_payment(action):
             _promo_set_status(pid, "unlisted")
             log.info("promotion unlisted (not activated, no refund): id=%s uid=%s mkt=%s num=%s", pid, uid, mkt, num)
             try:
-                label = _gift_label(coll_name, num)
-                msg = (f"You promoted {label} which is currently not listed on {mkt}. "
-                       f"Kindly cross check the information properly and try again.")
-                await _dm(uid, msg, bold_ranges=[(len("You promoted "), len(label))])
+                label, gift_url = _promo_label_link(coll_name, num, slug, promo.get("link"), mkt)
+                await _send_promo_notfound(uid, label, gift_url)
             except Exception:
                 pass
     else:
@@ -1807,62 +2470,118 @@ async def _record_payment(action):
 
 
 async def _send_sub_confirmation(uid, tier, switched_from=""):
-    """DM the member what they just unlocked, led by a premium gold-star custom
-    emoji (Premium users see the star; others see the fallback). Sent via the bot's
-    MTProto client so the custom emoji renders, with a plain-text fallback.
-    If they switched from another paid tier, a reminder to cancel the previous
-    subscription from Telegram is appended."""
-    if bot is None:
-        return
-    if tier == "pro":
-        header = "Scout Pro unlocked"
-        body = ("You can now scout with:\n"
-                "\u2726 Unlimited filters\n"
-                "\u2726 Your own custom referral code\n"
-                "\u2726 Earnings from the affiliate program\n"
-                "\u2726 An ad-free results feed with no promoted gifts")
-    else:
-        header = "Scout+ unlocked"
-        body = ("You can now upgrade your search with:\n"
-                "\u2726 Up to 5 of each filter per scout")
-    switch_note = ""
-    if switched_from:
-        switch_note = "\n\nYou switched plans \u2014 don't forget to cancel your previous subscription from Telegram so you aren't charged for both."
-    line = f"{header}\n\n{body}{switch_note}"
-    try:
-        from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityBold
-        def u16(s):
-            return len(s.encode("utf-16-le")) // 2
-        star = "\U0001F396\uFE0F"   # 🎖️ fallback; overlaid by the premium star
-        # star + space + bold(header) + rest
-        rest = f"\n\n{body}{switch_note}"
-        segs = [("emoji", star, EMOJI_STAR), ("text", " "), ("bold", header), ("text", rest)]
-        text, off, ents = "", 0, []
-        for kind, *r in segs:
-            s = r[0]; ln = u16(s)
-            if kind == "emoji":
-                ents.append(MessageEntityCustomEmoji(off, ln, int(r[1])))
-            elif kind == "bold":
-                ents.append(MessageEntityBold(off, ln))
-            text += s; off += ln
-        await bot.send_message(int(uid), text, formatting_entities=ents)
-    except Exception as e:
-        log.warning("sub confirmation (custom emoji) failed, sending plain: %s", e)
-        try:
-            await _bot_api("sendMessage", {"chat_id": int(uid), "text": line})
-        except Exception:
-            pass
+    """DM the member what their new subscription unlocks, in their language.
+    switched_from is accepted for signature compatibility but no longer appended —
+    switching plans auto-cancels the previous tier, so there's nothing to do."""
+    lang = _user_lang(uid)
+    msg = INFO + _t("sub_pro" if tier == "pro" else "sub_plus", lang)
+    await _dm(uid, msg)
+
+
+async def _send_sub_renewed(uid, tier):
+    """DM sent when Telegram auto-charges an existing subscription (a renewal)."""
+    plan = "scout pro" if tier == "pro" else "scout+"
+    msg = INFO + _t("sub_renewed", _user_lang(uid)).format(plan=plan)
+    await _dm(uid, msg)
+
+
+async def _send_sub_insufficient(uid, tier):
+    """DM sent when a subscription lapses without renewal (e.g. low Star balance).
+    The word 'hoton' links to the current top-up referral."""
+    plan = "scout pro" if tier == "pro" else "scout+"
+    msg = INFO + _t("sub_insufficient", _user_lang(uid)).format(plan=plan)
+    start = msg.rfind("hoton")
+    links = [(start, len("hoton"), HOTON_URL)] if start >= 0 else None
+    await _dm(uid, msg, link_ranges=links)
 
 
 async def _send_sub_cancel_confirmation(uid, tier):
-    """DM the member after they cancel, reminding them to also stop the
-    recurring charge from Telegram itself (cancelling in-app marks our records
-    but Telegram manages the actual Stars subscription renewal)."""
-    plan = "Scout Pro" if tier == "pro" else "Scout+"
-    msg = (f"Your {plan} plan has been cancelled on GiftTrove.\n\n"
-           f"Don't forget to cancel your subscription from Telegram as well, so it doesn't renew. "
-           f"You'll keep your current benefits until the active period ends.")
-    await _dm(uid, msg, bold_ranges=[(len("Your "), len(plan))])
+    """DM sent after a member cancels in-app — reminds them to also confirm the
+    cancellation in Telegram so the recurring Stars charge actually stops."""
+    plan = "scout pro" if tier == "pro" else "scout+"
+    msg = INFO + _t("sub_cancel", _user_lang(uid)).format(plan=plan)
+    await _dm(uid, msg)
+
+
+# ─── Promoted-gift DMs (label hyperlinks to the exact t.me gift link) ─────────
+async def _send_promo_live(uid, label, url, days):
+    msg = INFO + _t("promo_live", _user_lang(uid)).format(label=label, days=days)
+    links = [(len(INFO), len(label), url)] if url else None
+    await _dm(uid, msg, link_ranges=links)
+
+
+async def _send_promo_notfound(uid, label, url):
+    msg = INFO + _t("promo_notfound", _user_lang(uid)).format(label=label)
+    links = [(len(INFO), len(label), url)] if url else None
+    await _dm(uid, msg, link_ranges=links)
+
+
+async def _send_promo_bought(uid, label, url):
+    msg = INFO + _t("promo_bought", _user_lang(uid)).format(label=label)
+    links = [(len(INFO), len(label), url)] if url else None
+    await _dm(uid, msg, link_ranges=links)
+
+
+async def _send_promo_ended(uid, label, url):
+    msg = INFO + _t("promo_ended", _user_lang(uid)).format(label=label)
+    links = [(len(INFO), len(label), url)] if url else None
+    await _dm(uid, msg, link_ranges=links)
+
+
+# ─── Affiliate payout DMs + admin review ─────────────────────────────────────
+async def _send_payout_under_review(uid, stars):
+    """DM sent the moment a member submits a payout request (balance held pending)."""
+    gram = await _fmt_gram(stars)
+    msg = INFO + _t("payout_review", _user_lang(uid)).format(gram=gram)
+    await _dm(uid, msg)
+
+
+async def _send_payout_credited(uid, stars, addr):
+    """DM sent when an admin approves a payout (GRAM sent to the member's wallet)."""
+    gram = await _fmt_gram(stars)
+    when = time.strftime("%b %d, %Y \u00b7 %H:%M UTC", time.gmtime())
+    msg = INFO + _t("payout_credited", _user_lang(uid)).format(gram=gram, addr=addr, when=when)
+    start = msg.find(addr) if addr else -1
+    code = [(start, len(addr))] if (addr and start >= 0) else None
+    await _dm(uid, msg, code_ranges=code)
+
+
+async def _send_payout_declined(uid):
+    """DM sent when an admin declines a payout (held balance returns to available)."""
+    msg = INFO + _t("payout_declined", _user_lang(uid))
+    await _dm(uid, msg)
+
+
+async def _notify_admin_payout(payout, stats=None):
+    """Send the owner an interactive payout request (user id, amount in Stars and
+    GRAM, wallet address) with Approve / Decline buttons. Goes to every admin so
+    the request can be actioned from the owner's account."""
+    if bot is None:
+        return
+    try:
+        from telethon import Button
+    except Exception:
+        return
+    pid = payout.get("id"); uid = payout.get("uid")
+    stars = int(payout.get("stars") or 0); addr = payout.get("ton_address") or "—"
+    gram = await _fmt_gram(stars)
+    s = stats or _affiliate_stats(uid)
+    text = (
+        "**Affiliate payout request**\n\n"
+        f"User ID: `{uid}`\n"
+        f"Amount: {stars}\u2605  \u2248 {gram} GRAM\n"
+        f"Address: `{addr}`\n\n"
+        f"Referrals: {s.get('referees', 0)} \u00b7 Paid referees: {s.get('payers', 0)} "
+        f"\u00b7 Lifetime earned: {s.get('earned', 0)}\u2605\n"
+        f"Run an authenticity scan on `{uid}` in Analytics before approving."
+    )
+    buttons = [[Button.inline("Approve", f"affapprove:{pid}".encode()),
+                Button.inline("Decline", f"affdecline:{pid}".encode())]]
+    for admin in ADMIN_IDS:
+        try:
+            await bot.send_message(int(admin), text, buttons=buttons, parse_mode="md")
+        except Exception as e:
+            log.info("payout admin notify failed (admin=%s): %s", admin, e)
 
 
 async def _connect_user_session():
@@ -1941,7 +2660,13 @@ async def background_telethon_initializer():
         except Exception as e:
             log.info("collections pre-warm skipped: %s", e)
         asyncio.create_task(_bg_expire_promos())
+        asyncio.create_task(_bg_expire_subs())
         asyncio.create_task(_warm_inline_floors())
+        asyncio.create_task(_bg_warm_attributes())
+        # One-time backfill: members who were already on an active plus/pro
+        # subscription BEFORE the member-tag feature shipped only get tagged at
+        # their next payment event otherwise (up to 30 days away). Catch them now.
+        asyncio.create_task(_backfill_member_tags())
 
     # 2c) Reports: deploy-live good news + the daily digest loop.
     try:
@@ -2390,30 +3115,37 @@ async def fragment_search(tg_slug, gift_name, limit=24):
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://fragment.com/gifts",
     }
-    try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as cli:
-            r = await cli.get(url, headers=headers)
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code}")
-        items = _parse_fragment_gifts(r.text, tg_slug, gift_name, fslug)
-        _frag_cache[fslug] = (now, items)
-        if len(_frag_cache) > 200:
-            _frag_cache.pop(next(iter(_frag_cache)))
-        return items[:limit]
-    except Exception as e:
-        log.info("fragment search skipped: %s", e)
-        if now - _frag_fail_noted > 3600:
-            _frag_fail_noted = now
-            try:
-                await notify_admin(f"Fragment scrape failing: {type(e).__name__}: {e}", level="warning")
-            except Exception:
-                pass
-        stale = _frag_cache.get(fslug)
-        return stale[1][:limit] if stale else []
+    # Fragment is an unofficial scrape target behind Cloudflare, so an occasional
+    # transient 500/429 is expected, not a real outage — retry once after a short
+    # delay before treating it as a genuine failure worth alerting on.
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=6, follow_redirects=True) as cli:
+                r = await cli.get(url, headers=headers)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            items = _parse_fragment_gifts(r.text, tg_slug, gift_name, fslug)
+            _frag_cache[fslug] = (now, items)
+            if len(_frag_cache) > 200:
+                _frag_cache.pop(next(iter(_frag_cache)))
+            return items[:limit]
+        except Exception as e:
+            if attempt == 0:
+                await asyncio.sleep(0.7)
+                continue
+            log.info("fragment search skipped: %s", e)
+            if now - _frag_fail_noted > 3600:
+                _frag_fail_noted = now
+                try:
+                    await notify_admin(f"Fragment scrape failing: {type(e).__name__}: {e}", level="warning")
+                except Exception:
+                    pass
+            stale = _frag_cache.get(fslug)
+            return stale[1][:limit] if stale else []
 
 
 # ─── MarketApp aggregator (Tonnel / Portals / Fragment / GetGems / MarketApp) ──
-# Endpoints (from their OpenAPI spec at api.marketapp.ws/docs/openapi.json):
+# Endpoints (from their OpenAPI spec at api.marketapp.org/docs/openapi.json):
 #   GET /v1/collections/gifts/           → [{name, address, extra_data}]  (name→TON addr map)
 #   GET /v1/gifts/onsale/                → {cursor, items:[NFTItem]}
 #
@@ -2491,25 +3223,29 @@ async def _marketapp_collection_address(gift_name, slug):
 
     return None
 
+_BACKDROP_HEX = {}   # {backdrop_name_lower: hex} — backdrop colours are universal
+                     # across gifts, so this fills from any /api/attributes call and
+                     # lets MarketApp/Fragment listings resolve a colour dot even
+                     # when no per-gift attribute data is cached for them yet.
+
 def _backdrop_hex_lookup(gift_id, backdrop_name):
-    """Resolve a backdrop colour hex by name, reusing whatever attribute data
-    is already cached for this gift_id (from /api/attributes) — no network call.
-    Used to give Fragment/MarketApp listings the same colour dot as Telegram ones,
-    since they share the same official backdrop names."""
-    if not gift_id or not backdrop_name:
-        return None
-    gift_id = _digits(gift_id)
-    payload = cache_get(f"attrs:{gift_id}")
-    if not (payload and isinstance(payload, dict)):
-        db_payload, _ts = _attrs_db_get(gift_id)
-        payload = (db_payload or {}).get("resp") if isinstance(db_payload, dict) else None
-    if not (payload and isinstance(payload, dict)):
+    """Resolve a backdrop colour hex by name. Tries the per-gift attribute cache
+    first (from /api/attributes), then falls back to the global name->hex map,
+    so Fragment/MarketApp listings get the same colour dot as Telegram ones."""
+    if not backdrop_name:
         return None
     name_l = backdrop_name.strip().lower()
-    for b in payload.get("backdrops") or []:
-        if str(b.get("name") or "").strip().lower() == name_l:
-            return b.get("hex")
-    return None
+    gift_id = _digits(gift_id) if gift_id else None
+    if gift_id:
+        payload = cache_get(f"attrs:{gift_id}")
+        if not (payload and isinstance(payload, dict)):
+            db_payload, _ts = _attrs_db_get(gift_id)
+            payload = (db_payload or {}).get("resp") if isinstance(db_payload, dict) else None
+        if payload and isinstance(payload, dict):
+            for b in payload.get("backdrops") or []:
+                if str(b.get("name") or "").strip().lower() == name_l:
+                    return b.get("hex") or _BACKDROP_HEX.get(name_l)
+    return _BACKDROP_HEX.get(name_l)
 
 
 def _marketapp_item(raw, gift_name, fallback_slug, gift_id=None):
@@ -2520,15 +3256,28 @@ def _marketapp_item(raw, gift_name, fallback_slug, gift_id=None):
         num = int(num) if num is not None else None
     except Exception:
         num = None
-    # min_bid is nanotons (string) → divide by 1e9 for TON/GRAM value
+    # min_bid / max_bid are integer-string amounts in the listing's OWN currency,
+    # scaled by that currency's decimals: TON/GRAM = 9 decimals (nanotons),
+    # USDT = 6 decimals. For a fixed-price sale min_bid == max_bid; for an auction
+    # min_bid is the opening bid and max_bid the buy-now — take the higher so a low
+    # opening bid can't masquerade as the floor in the "lowest" sort.
+    currency_raw = str(raw.get("currency") or "TON").upper()
+    # Launching with Stars / GRAM(TON) / USDT only. Some aggregated listings (e.g.
+    # via GetGems) are priced in other coins — skip them entirely rather than
+    # mislabel the amount and confuse buyers.
+    if currency_raw not in ("TON", "GRAM", "USDT"):
+        return None
+    _scale = 1e6 if currency_raw == "USDT" else 1e9
     try:
-        price = float(raw.get("min_bid") or 0) / 1e9
-        if price <= 0:
-            price = None
+        _minb = float(raw.get("min_bid") or 0)
+        _maxb = float(raw.get("max_bid") or 0)
+        bid = _maxb if _maxb > _minb else _minb
+        price = bid / _scale if bid > 0 else None
     except Exception:
         price = None
-    currency_raw = str(raw.get("currency") or "TON").upper()
     if currency_raw == "USDT":
+        # Priced in USDT — show the real USDT amount; it is NOT a GRAM/TON value,
+        # so don't expose a gram_value (the frontend won't mislabel it).
         currency, gram_value = "USDT", None
     else:
         currency, gram_value = "GRAM", price   # TON == GRAM (rebrand)
@@ -2545,11 +3294,11 @@ def _marketapp_item(raw, gift_name, fallback_slug, gift_id=None):
     slug = fallback_slug  # not in response; use the one we looked up with
     # Always link to MarketApp so the user buys there (they came from MarketApp chip).
     if nft_address:
-        url = f"https://marketapp.ws/nft/{nft_address}/"
+        url = f"https://marketapp.org/nft/{nft_address}/"
     elif coll_address:
-        url = f"https://marketapp.ws/collection/{coll_address}/"
+        url = f"https://marketapp.org/collection/{coll_address}/"
     else:
-        url = "https://marketapp.ws/gifts/"
+        url = "https://marketapp.org/gifts/"
     backdrop_name = _attr("backdrop", "background") or ""
     # MarketApp's own "name" field already includes the item number, e.g.
     # "Plush Pepe #476" — strip that suffix so the frontend (which appends
@@ -2588,7 +3337,7 @@ async def marketapp_search(slug, gift_name, gift_id=None, limit=40,
     if symbol:   params["symbol"]  = symbol
     if backdrop: params["backdrop"] = backdrop
     try:
-        async with httpx.AsyncClient(timeout=12) as cli:
+        async with httpx.AsyncClient(timeout=8) as cli:
             r = await cli.get(url, params=params,
                               headers={"Authorization": MARKETAPP_TOKEN, "Accept": "application/json"})
         log.info("marketapp %s status=%s sample=%s", url, r.status_code,
@@ -2993,8 +3742,87 @@ def _attrs_db_set(gift_id, payload):
         log.info("attrs db write skipped: %s", e)
 
 
+async def _fetch_attributes_live(gift_id):
+    """Live MTProto fetch of a collection's models/symbols/backdrops + thumbnail
+    images, persisted to the durable Postgres copy (survives restarts) and the
+    in-memory cache. Raises on failure — callers decide how to handle that
+    (the endpoint falls back to stale data; the background warmer just skips
+    and retries next pass)."""
+    GetResale = _payments("GetResaleStarGiftsRequest")
+    if client is None:
+        raise RuntimeError("MTProto client not initialised yet")
+    if not GetResale:
+        raise RuntimeError("GetResaleStarGiftsRequest missing — pip install -U telethon")
+    res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0, offset="", limit=1))
+    models, symbols, backdrops = [], [], []
+    model_docs, symbol_docs = [], []
+    id_map = {"model": {}, "symbol": {}, "backdrop": {}}
+    for a in getattr(res, "attributes", []) or []:
+        cls = type(a).__name__
+        name = getattr(a, "name", None)
+        rar = getattr(a, "rarity_permille", None)
+        rar = round(rar / 10, 2) if isinstance(rar, (int, float)) else None
+        aid = _attr_id(a)
+        if cls == "StarGiftAttributeModel":
+            models.append({"name": name, "rarity": rar, "img": None})
+            model_docs.append(getattr(a, "document", None))
+            if name and aid is not None:
+                id_map["model"][name] = aid
+        elif cls == "StarGiftAttributePattern":
+            symbols.append({"name": name, "rarity": rar, "img": None})
+            symbol_docs.append(getattr(a, "document", None))
+            if name and aid is not None:
+                id_map["symbol"][name] = aid
+        elif cls == "StarGiftAttributeBackdrop":
+            _bd_hex = color_hex(getattr(a, "center_color", None))
+            backdrops.append({
+                "name": name, "rarity": rar,
+                "hex": _bd_hex,
+                "edge": color_hex(getattr(a, "edge_color", None)),
+            })
+            if name and _bd_hex:
+                _BACKDROP_HEX[name.strip().lower()] = _bd_hex   # universal colour
+            if name and aid is not None:
+                id_map["backdrop"][name] = aid
+    # Real images for models + symbols, fetched in parallel (cached).
+    imgs = await asyncio.gather(
+        *[_doc_thumb_uri(d) for d in model_docs + symbol_docs],
+        return_exceptions=True,
+    )
+    for i, m in enumerate(models):
+        v = imgs[i]
+        m["img"] = v if isinstance(v, str) else None
+    for j, s in enumerate(symbols):
+        v = imgs[len(model_docs) + j]
+        s["img"] = v if isinstance(v, str) else None
+    _attr_ids_cache[str(gift_id)] = id_map
+    result = {"models": models, "symbols": symbols, "backdrops": backdrops}
+    key = f"attrs:{gift_id}"
+    cache_set(key, result, ttl=21600)          # attributes barely change — 6h
+    _attrs_stale[str(gift_id)] = result        # long-lived safety copy
+    # The persisted "resp" already embeds each thumbnail as a base64 data URI
+    # (see _doc_thumb_uri above), so this durable copy carries the images too —
+    # a warm DB hit never needs to touch Telegram for icons, only for the
+    # attribute LIST itself when it's missing or stale.
+    _attrs_db_set(gift_id, {"resp": result, "ids": _idmap_to_jsonable(id_map)})   # survives restarts
+    return result
+
+
+# How long a durable attributes copy is trusted before the endpoint will do a
+# live re-fetch on a real user's request (worst case, cold path).
+_ATTRS_DB_TTL = 7 * 86400
+# How long before that same expiry the background warmer proactively refreshes
+# it — well ahead of the hard cutoff, so in practice a real user almost never
+# hits the cold path at all; the warmer keeps every collection topped up first.
+_ATTRS_WARM_MARGIN = 2 * 86400
+
+
 @app.get("/api/attributes")
-async def attributes(gift_id: str = Query(...)):
+async def attributes(request: Request, gift_id: str = Query(...),
+                     x_init_data: str = Header(default="", alias="X-Init-Data")):
+    _vuid, _blocked = _data_guard(request, x_init_data)
+    if _blocked is not None:
+        return _blocked
     gift_id = _digits(gift_id)
     if not gift_id:
         return {"models": [], "symbols": [], "backdrops": []}
@@ -3002,10 +3830,11 @@ async def attributes(gift_id: str = Query(...)):
     cached = cache_get(key)
     if cached and str(gift_id) in _attr_ids_cache:
         return cached
-    # RESTART-PROOF PATH: durable Postgres copy (response + attribute-id map)
-    # serves instantly after a deploy; live fetch only when no usable copy.
+    # RESTART-PROOF PATH: durable Postgres copy (response + attribute-id map,
+    # thumbnails included) serves instantly after a deploy; live fetch only
+    # when no usable copy exists yet.
     db_payload, db_ts = _attrs_db_get(gift_id)
-    if db_payload and isinstance(db_payload, dict) and db_payload.get("resp") and (time.time() - db_ts) < 7 * 86400:
+    if db_payload and isinstance(db_payload, dict) and db_payload.get("resp") and (time.time() - db_ts) < _ATTRS_DB_TTL:
         if db_payload.get("ids"):
             _attr_ids_cache[str(gift_id)] = _idmap_from_jsonable(db_payload["ids"])
         resp = db_payload["resp"]
@@ -3013,57 +3842,8 @@ async def attributes(gift_id: str = Query(...)):
         _attrs_stale[str(gift_id)] = resp
         return resp
     empty = {"models": [], "symbols": [], "backdrops": []}
-    GetResale = _payments("GetResaleStarGiftsRequest")
-    if client is None:
-        return empty
-    if not GetResale:
-        return {**empty, "error": "GetResaleStarGiftsRequest missing — pip install -U telethon"}
     try:
-        res = await _invoke(lambda: GetResale(gift_id=int(gift_id), attributes_hash=0, offset="", limit=1))
-        models, symbols, backdrops = [], [], []
-        model_docs, symbol_docs = [], []
-        id_map = {"model": {}, "symbol": {}, "backdrop": {}}
-        for a in getattr(res, "attributes", []) or []:
-            cls = type(a).__name__
-            name = getattr(a, "name", None)
-            rar = getattr(a, "rarity_permille", None)
-            rar = round(rar / 10, 2) if isinstance(rar, (int, float)) else None
-            aid = _attr_id(a)
-            if cls == "StarGiftAttributeModel":
-                models.append({"name": name, "rarity": rar, "img": None})
-                model_docs.append(getattr(a, "document", None))
-                if name and aid is not None:
-                    id_map["model"][name] = aid
-            elif cls == "StarGiftAttributePattern":
-                symbols.append({"name": name, "rarity": rar, "img": None})
-                symbol_docs.append(getattr(a, "document", None))
-                if name and aid is not None:
-                    id_map["symbol"][name] = aid
-            elif cls == "StarGiftAttributeBackdrop":
-                backdrops.append({
-                    "name": name, "rarity": rar,
-                    "hex": color_hex(getattr(a, "center_color", None)),
-                    "edge": color_hex(getattr(a, "edge_color", None)),
-                })
-                if name and aid is not None:
-                    id_map["backdrop"][name] = aid
-        # Real images for models + symbols, fetched in parallel (cached).
-        imgs = await asyncio.gather(
-            *[_doc_thumb_uri(d) for d in model_docs + symbol_docs],
-            return_exceptions=True,
-        )
-        for i, m in enumerate(models):
-            v = imgs[i]
-            m["img"] = v if isinstance(v, str) else None
-        for j, s in enumerate(symbols):
-            v = imgs[len(model_docs) + j]
-            s["img"] = v if isinstance(v, str) else None
-        _attr_ids_cache[str(gift_id)] = id_map
-        result = {"models": models, "symbols": symbols, "backdrops": backdrops}
-        cache_set(key, result, ttl=21600)          # attributes barely change — 6h
-        _attrs_stale[str(gift_id)] = result        # long-lived safety copy
-        _attrs_db_set(gift_id, {"resp": result, "ids": _idmap_to_jsonable(id_map)})   # survives restarts
-        return result
+        return await _fetch_attributes_live(gift_id)
     except Exception as e:
         log.error("attributes error: %s", e)
         # Transient MTProto hiccup: serve the last good copy (memory, then
@@ -3079,8 +3859,60 @@ async def attributes(gift_id: str = Query(...)):
         return {**empty, "error": str(e)}
 
 
+async def _bg_warm_attributes():
+    """Recurring background pass: keep every known collection's attributes
+    (+ thumbnails) fresh in the durable cache BEFORE a real user's request would
+    ever hit the slow live-MTProto path. Paced gently (one collection every few
+    seconds) so it never competes with real traffic for the single MTProto
+    connection, and skips anything that's already fresh. A flood-wait during a
+    warm pass just fails that one collection silently — _invoke already handles
+    that — and it gets picked up again on the next pass a few hours later."""
+    while True:
+        try:
+            await asyncio.sleep(30)   # let startup settle before the first pass
+            try:
+                colls = _collections_db_get() or []
+            except Exception:
+                colls = []
+            warmed = 0
+            for c in colls:
+                gid = str(c.get("gift_id") or "")
+                if not gid:
+                    continue
+                try:
+                    _, db_ts = _attrs_db_get(gid)
+                    fresh_until = db_ts + _ATTRS_DB_TTL - _ATTRS_WARM_MARGIN
+                    if db_ts and time.time() < fresh_until:
+                        continue   # already fresh enough, skip
+                    await _fetch_attributes_live(gid)
+                    warmed += 1
+                except Exception as e:
+                    log.info("attr warm skipped for gift_id=%s: %s", gid, e)
+                await asyncio.sleep(4)   # gentle pacing — never burst MTProto
+            if warmed:
+                log.info("attribute warm pass: refreshed %d/%d collection(s)", warmed, len(colls))
+            await asyncio.sleep(6 * 3600)   # next pass in 6 hours
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.info("_bg_warm_attributes error: %s", e)
+            await asyncio.sleep(3600)
+
+
+async def _src_budget(coro, seconds, label):
+    """Run one marketplace fetch under a hard wall-clock budget. A slow or hung
+    source returns [] instead of stalling the whole search — the response goes
+    out with whatever the fast sources found."""
+    try:
+        return await asyncio.wait_for(coro, timeout=seconds) or []
+    except Exception as e:
+        log.info("%s source skipped (budget/err): %s", label, e)
+        return []
+
+
 @app.get("/api/search")
 async def search(
+    request: Request,
     gift: str = Query(""),
     gift_id: str = Query(""),
     slug: str = Query(""),
@@ -3097,7 +3929,14 @@ async def search(
     max_price: float = Query(0),
     x_init_data: str = Header(default="", alias="X-Init-Data"),
 ):
-    if not rate_ok(uid):
+    # Anti-scraping gate: a valid, fresh Telegram signature is the ticket in.
+    vuid, _blocked = _data_guard(request, x_init_data)
+    if _blocked is not None:
+        return _blocked
+    # Rate-limit the VERIFIED identity — rotating the spoofable `uid` query
+    # param no longer buys a fresh bucket. Unsigned dev-mode calls fall back
+    # to a per-IP identity.
+    if not rate_ok(vuid or f"ip:{_client_ip(request)}"):
         return {"results": [], "rate_limited": True}
     # Strict input validation (blocks malformed / injection-style input).
     gift = _clamp(gift, 64)
@@ -3115,10 +3954,9 @@ async def search(
         track_search(gift)
 
     # Premium tier governs how many of each attribute filter (model/symbol/backdrop)
-    # may apply at once: free 1, plus 5, pro unlimited. Identity comes from signed
-    # initData so a modified client can't raise its own caps; the spoofable query
-    # `uid` is used only for rate-limiting and tracking.
-    vuid = verify_init_data(x_init_data)
+    # may apply at once: free 1, plus 5, pro unlimited. Identity comes from the
+    # signed initData already verified by the guard above; the spoofable query
+    # `uid` is used only for tracking.
     cap = TIER_CAPS.get(get_tier(vuid), 1)
     def _csv_attr(s):
         out = []
@@ -3139,6 +3977,27 @@ async def search(
            "backdrop": {n.lower() for n in backdrops}}
 
     want = set([m.strip() for m in markets.split(",") if m.strip()]) if markets else set()
+
+    # Short-lived result cache (~25s): when many people search the same gift in
+    # a tight window — exactly what happens on a popular collection — this
+    # serves every one of them from one cached response instead of repeating
+    # the same MTProto/HTTP calls per person. This is what actually protects
+    # the single Telegram session from flood-waits under real concurrent load;
+    # it keeps working unchanged whether there's 1 session behind it or several.
+    # Only applied to fresh searches (no offset) — a "load more" page is always
+    # fetched live so pagination cursors stay correct.
+    _cache_key = None
+    if not offset:
+        _cache_key = "search:" + "|".join([
+            gift, gift_id, slug, num, sort,
+            f"{min_price:g}", f"{max_price:g}", str(limit),
+            ",".join(sorted(want)), ",".join(sorted(models)),
+            ",".join(sorted(symbols)), ",".join(sorted(backdrops)),
+        ])
+        _cached = cache_get(_cache_key)
+        if _cached is not None:
+            return _cached
+
     results = []
     next_offset = ""
     limit = max(1, min(int(limit or SEARCH_LIMIT), SEARCH_MAX))
@@ -3146,10 +4005,15 @@ async def search(
 
     # Resolve selected model/symbol/backdrop NAMES to attribute IDs so Telegram
     # filters server-side (otherwise matches on deeper pages get missed -> the
-    # false "no listings" bug). Ensure the id map for this gift is populated.
+    # false "no listings" bug). Populate the id map directly (durable copy first,
+    # live fetch as fallback) — NOT via the HTTP endpoint, which is now guarded.
     if gift_id and any_attr and str(gift_id) not in _attr_ids_cache:
         try:
-            await attributes(gift_id=str(gift_id))
+            db_payload, _ts = _attrs_db_get(gift_id)
+            if db_payload and isinstance(db_payload, dict) and db_payload.get("ids"):
+                _attr_ids_cache[str(gift_id)] = _idmap_from_jsonable(db_payload["ids"])
+            else:
+                await _fetch_attributes_live(gift_id)
         except Exception:
             pass
     ids = _attr_ids_cache.get(str(gift_id), {})
@@ -3168,6 +4032,29 @@ async def search(
             if names and (item.get(typ) or "").lower() not in names:
                 return False
         return True
+
+    flood = False
+    # ── PARALLEL FAN-OUT ─────────────────────────────────────────────────────
+    # Kick the secondary marketplaces off as background tasks NOW, before the
+    # Telegram fetch starts, so their network time overlaps with Telegram's
+    # instead of stacking after it. This is the difference between a search
+    # taking max(telegram, fragment, marketapp) and taking the SUM of all
+    # three — the single biggest wall-clock win available. Each task carries a
+    # hard time budget so one slow source can never hold the response hostage.
+    # Same gating rules as before: first page only, market selection respected,
+    # Fragment skipped when attribute filters are set.
+    sec_tasks = []
+    if gift and not offset and (not want or "GetGems" in want):
+        sec_tasks.append(asyncio.create_task(
+            _src_budget(getgems_search(gift, limit=12), 6, "getgems")))
+    if slug and not any_attr and not offset and (not want or "Fragment" in want):
+        sec_tasks.append(asyncio.create_task(
+            _src_budget(fragment_search(slug, gift, limit=40), 9, "fragment")))
+    if MARKETAPP_TOKEN and (slug or gift) and not offset and (not want or "MarketApp" in want):
+        sec_tasks.append(asyncio.create_task(
+            _src_budget(marketapp_search(
+                slug, gift, gift_id=gift_id, limit=40,
+                model=model, symbol=symbol, backdrop=backdrop), 9, "marketapp")))
 
     if client is not None and GetResale and gift_id and (not want or "Telegram" in want):
         try:
@@ -3204,32 +4091,45 @@ async def search(
                     next_offset = ""
                     break
         except FloodWaitError:
-            return {"results": results, "next_offset": next_offset, "flood": True}
+            # Telegram is rate-limiting us right now. Don't abort the whole
+            # search — Fragment/MarketApp tasks are already in flight and their
+            # results still go out below; only the Telegram slice is degraded.
+            flood = True
         except Exception as e:
             log.error("native search error: %s", repr(e))
 
-    if gift and (not want or "GetGems" in want):
-        results.extend(await getgems_search(gift, limit=12))
-
-    # Fragment: real scraped listings. Attribute filters are Telegram-native
-    # only, so Fragment is skipped when model/symbol/backdrop is selected
-    # (better no results than wrong ones).
-    if slug and not any_attr and (not want or "Fragment" in want):
+    # Collect the parallel marketplace tasks (started before the Telegram
+    # block). Task order — GetGems, Fragment, MarketApp — matches the old
+    # sequential order, so the dedup pass below keeps the same source priority.
+    # By now they've been running the whole time Telegram was fetching, so in
+    # the common case these awaits return instantly.
+    for _t in sec_tasks:
         try:
-            results.extend(await fragment_search(slug, gift, limit=40))
+            chunk = await _t
+            if chunk:
+                results.extend(chunk)
         except Exception as e:
-            log.info("fragment dispatch skipped: %s", e)
+            log.info("secondary source task failed: %s", e)
 
-    # MarketApp aggregator (Tonnel / Portals / Fragment / GetGems / MarketApp).
-    # Dormant unless MARKETAPP_TOKEN is set; never raises into the scout.
-    # Passes attribute filters natively so results are precise.
-    if MARKETAPP_TOKEN and (slug or gift) and (not want or "MarketApp" in want):
-        try:
-            results.extend(await marketapp_search(
-                slug, gift, gift_id=gift_id, limit=40,
-                model=model, symbol=symbol, backdrop=backdrop))
-        except Exception as e:
-            log.info("marketapp dispatch skipped: %s", e)
+    # Cross-source de-dup: MarketApp's own aggregator already pulls in Fragment/
+    # GetGems/Portals/Tonnel listings, so the SAME physical NFT can legitimately
+    # come back twice — once from our direct Fragment/GetGems call, once again
+    # via MarketApp's passthrough — each with a different per-source id string,
+    # which a plain id-based dedup can't catch. Key by the gift's true identity
+    # (collection + item number) instead, and keep the first occurrence — which
+    # respects our existing priority order: Telegram-native, then GetGems, then
+    # Fragment, then MarketApp.
+    if len(results) > 1:
+        seen_phys, deduped = set(), []
+        for r in results:
+            n = str(r.get("num") or "").strip()
+            base = str(r.get("slug") or r.get("name") or "").strip().lower()
+            key = f"{base}#{n}" if (base and n) else f"id:{r.get('id')}"
+            if key in seen_phys:
+                continue
+            seen_phys.add(key)
+            deduped.append(r)
+        results = deduped
 
     # Optional price-range filter (applies to numeric prices in the page).
     if min_price or max_price:
@@ -3250,22 +4150,31 @@ async def search(
     # Telegram/Fragment/GetGems, or an approximate Stars->GRAM conversion when
     # Telegram gave no TON value. Cheapest first for price_asc, highest first for
     # price_desc; unpriced always last. No per-market interleaving.
-    def _gram_value(r):
-        gv = r.get("gram_value")
-        if gv is not None:
-            return gv
-        p = r.get("price")
-        if p is None:
-            return None
-        if str(r.get("currency") or "").lower().startswith("star"):
-            return (p / STARS_PER_TON) if STARS_PER_TON else p
-        return p
     # General is the default: keep the natural order the marketplaces return, and
     # only rank by price when the user explicitly taps Lowest or Highest.
     if sort in ("price_asc", "price_desc"):
+        # Convert every listing to a USD value for fair cross-currency ranking.
+        # Stars: official Telegram sell rate (from payments.getStarsRevenueStats).
+        # GRAM/TON: live Binance spot × price in GRAM.
+        # USDT: 1:1 (it's already USD-pegged).
+        # Display always stays in the listing's real currency — this only affects order.
+        ton_usd   = await _ton_usd_rate()
+        stars_usd = await _stars_usd_rate()
+        def _usd_value(r):
+            p = r.get("price")
+            if p is None:
+                return None
+            cur = str(r.get("currency") or "").lower()
+            if cur == "usdt":
+                return float(p)
+            if cur.startswith("star"):
+                return float(p) * (stars_usd or STARS_USD_RATE)
+            # GRAM / TON — use gram_value if present (already in GRAM), else price
+            gv = r.get("gram_value")
+            return float(gv if gv is not None else p) * (ton_usd or USDT_PER_TON)
         rev = (sort == "price_desc")
-        results.sort(key=lambda r: (_gram_value(r) is None,
-                                    -(_gram_value(r) or 0) if rev else (_gram_value(r) or 0)))
+        results.sort(key=lambda r: (_usd_value(r) is None,
+                                    -(_usd_value(r) or 0) if rev else (_usd_value(r) or 0)))
 
     # Stamp the collection's gift_id onto every result so the client can persist it
     # (e.g. when saving a gift) and later ask /api/check_listings whether it's sold.
@@ -3273,11 +4182,22 @@ async def search(
         for r in results:
             r["gift_id"] = gift_id
 
-    return {"results": results, "next_offset": next_offset, "count": len(results)}
+    payload = {"results": results, "next_offset": next_offset, "count": len(results)}
+    if flood:
+        payload["flood"] = True
+    # Never pin a flood-degraded page into the 25s cache — the next request may
+    # get the full Telegram slice back and should be allowed to.
+    if _cache_key and not flood:
+        cache_set(_cache_key, payload, 25)
+    return payload
 
 
 @app.get("/api/gift")
-async def gift(slug: str = Query(...)):
+async def gift(request: Request, slug: str = Query(...),
+               x_init_data: str = Header(default="", alias="X-Init-Data")):
+    _vuid, _blocked = _data_guard(request, x_init_data)
+    if _blocked is not None:
+        return _blocked
     slug = _safe_slug(slug)
     if not slug:
         return {"error": "bad-slug"}
@@ -3326,6 +4246,59 @@ async def access(uid: str = Query(""), code: str = Query(""), x_init_data: str =
             _maybe_milestone()
         return {"ok": True, "admin": is_admin, "new_member": new_member}
     return {"ok": False, "admin": False}
+
+
+# In-memory avatar cache: uid -> (jpeg_bytes_or_None, fetched_at). Profile photos
+# rarely change and downloading via MTProto can hit flood waits, so we cache both
+# hits and misses for a while to keep the endpoint cheap.
+_AVATAR_CACHE = {}
+_AVATAR_TTL = 6 * 3600  # 6h
+
+@app.get("/api/avatar")
+async def avatar(uid: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Return the caller's Telegram profile photo as a JPEG.
+
+    The frontend tries the `photo_url` Telegram puts in initData first; it's only
+    present in some launch contexts, so this is the fallback. Identity comes from
+    the signed initData when available (can't be spoofed); we fall back to the uid
+    param only for resolving which user to fetch. Any failure returns 404 and the
+    client shows the mascot instead.
+    """
+    from fastapi.responses import Response
+    eff = verify_init_data(x_init_data) or _digits(uid)
+    if not eff:
+        return JSONResponse(status_code=404, content={"ok": False})
+
+    now = time.time()
+    cached = _AVATAR_CACHE.get(eff)
+    if cached and now - cached[1] < _AVATAR_TTL:
+        if cached[0]:
+            return Response(content=cached[0], media_type="image/jpeg",
+                            headers={"Cache-Control": "public, max-age=21600"})
+        return JSONResponse(status_code=404, content={"ok": False})
+
+    data = None
+    try:
+        # The full user client resolves arbitrary users by id and can fetch their
+        # public profile photo. Guard with a tight timeout so a flood-wait or
+        # cross-DC stall can never hang the request.
+        if client is not None:
+            import io
+            buf = io.BytesIO()
+            await asyncio.wait_for(
+                client.download_profile_photo(int(eff), file=buf), timeout=8
+            )
+            b = buf.getvalue()
+            data = b if b else None
+    except Exception as e:
+        log.info("avatar fetch failed for %s: %s", eff, type(e).__name__)
+        data = None
+
+    _AVATAR_CACHE[eff] = (data, now)
+    if data:
+        return Response(content=data, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=21600"})
+    return JSONResponse(status_code=404, content={"ok": False})
 
 
 @app.get("/api/analytics")
@@ -3492,6 +4465,14 @@ async def subscription_cancel(x_init_data: str = Header(default="", alias="X-Ini
         return {"ok": False, "error": "no_active_subscription"}
     row = _sub_row(uid)
     charge_id = row[1] if row else ""
+    # Mark cancelled so a later lapse isn't mistaken for a failed renewal (the
+    # insufficient-balance sweep skips rows with cancelled=1).
+    try:
+        with db() as conn:
+            conn.execute("UPDATE subs SET cancelled=1 WHERE uid=?", (str(uid),))
+            conn.commit()
+    except Exception as e:
+        log.info("mark sub cancelled failed: %s", e)
     cancelled = False
     if charge_id and bot is not None:
         try:
@@ -3571,6 +4552,18 @@ async def consent(x_init_data: str = Header(default="", alias="X-Init-Data")):
         log.info("consent optout-clear skipped: %s", e)
     _bcast_add(uid)
     return {"ok": True}
+
+
+@app.post("/api/lang")
+async def set_lang(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Sync the in-app language switcher to the backend so the bot DMs the member
+    in the language they chose. Accepts 'en' | 'ru' | 'zh' (case-insensitive)."""
+    uid = verify_init_data(x_init_data)
+    if not uid:
+        return {"ok": False}
+    lang = _norm_lang(str(payload.get("lang") or ""))
+    _set_user_lang(uid, lang)
+    return {"ok": True, "lang": lang}
 
 
 # ─── Promoted gifts (one-time Stars, available to everyone) ──────────────────
@@ -3671,22 +4664,10 @@ async def _bg_verify_promo(p: dict):
         num = p.get("num") or ""
         mkt = p.get("marketplace") or "Telegram"
         coll = p.get("collection") or "your gift"
-        gift_url = p.get("link") or (f"https://t.me/nft/{slug}-{num}" if slug and num else "")
         if uid:
             try:
-                label = _gift_label(coll, num)
-                msg = (f"Congratulations\n\n"
-                       f"Your promoted gift {label} has been purchased. "
-                       f"The gift is no longer displayed in the top search.")
-                if gift_url:
-                    msg += f"\n{gift_url}"
-                # bold the "Congratulations" header + the gift label
-                cong_len = len("Congratulations")
-                label_start = msg.find(label, cong_len)
-                ranges = [(0, cong_len)]
-                if label_start >= 0:
-                    ranges.append((label_start, len(label)))
-                await _dm(uid, msg, bold_ranges=ranges)
+                label, gift_url = _promo_label_link(coll, num, slug, p.get("link"), mkt)
+                await _send_promo_bought(uid, label, gift_url)
             except Exception as e:
                 log.info("sold notify DM failed: %s", e)
 
@@ -3716,21 +4697,88 @@ async def _bg_expire_promos():
                 num = r["num"] or ""
                 slug = r["slug"] or ""
                 mkt = r["marketplace"] or "Telegram"
-                gift_url = r["link"] or (f"https://t.me/nft/{slug}-{num}" if slug and num else "")
                 if uid:
                     try:
-                        label = _gift_label(coll, num)
-                        msg = (f"Your promotion for {label} has ended after {PROMO_DAYS} days. "
-                               f"You can consider adjusting the listed value and trying again.")
-                        if gift_url:
-                            msg += f"\n{gift_url}"
-                        await _dm(uid, msg, bold_ranges=[(len("Your promotion for "), len(label))])
+                        label, gift_url = _promo_label_link(coll, num, slug, r["link"], mkt)
+                        await _send_promo_ended(uid, label, gift_url)
                     except Exception as e:
                         log.info("expiry notify DM failed: %s", e)
         except asyncio.CancelledError:
             break
         except Exception as e:
             log.info("_bg_expire_promos error: %s", e)
+
+
+async def _bg_expire_subs():
+    """Periodic: (1) DM members whose subscription period ended WITHOUT a renewal
+    (most commonly because their Star balance was too low to auto-charge) — only
+    rows that weren't cancelled in-app (cancelled=0) and weren't already notified
+    (end_notified=0) are messaged; (2) clear the community-chat member tag for
+    EVERY expiry, cancelled or not — tags don't auto-expire on Telegram's side
+    the way tier access does, so this is what actually removes the badge the
+    moment a subscription truly ends, regardless of how it ended.
+
+    Caveat: Telegram does not tell a bot *why* a renewal didn't happen, so a member
+    who cancels directly inside Telegram (rather than via the GiftTrove app) would
+    also receive this top-up nudge. The message is harmless in that case."""
+    while True:
+        try:
+            await asyncio.sleep(3600)   # hourly
+            now = int(time.time())
+            window = now - 2 * 86400    # caught if it lapsed within the last ~2 days
+            try:
+                with db() as conn:
+                    rows = conn.execute(
+                        "SELECT uid, tier FROM subs WHERE expires_at<=? AND expires_at>=? "
+                        "AND COALESCE(cancelled,0)=0 AND COALESCE(end_notified,0)=0 "
+                        "AND tier IN ('plus','pro')",
+                        (now, window)).fetchall()
+            except Exception:
+                rows = []
+            for r in rows:
+                uid = r["uid"] or ""
+                tier = r["tier"] or "plus"
+                if not uid:
+                    continue
+                try:
+                    with db() as conn:
+                        conn.execute("UPDATE subs SET end_notified=1 WHERE uid=?", (str(uid),))
+                        conn.commit()
+                except Exception:
+                    pass
+                try:
+                    await _send_sub_insufficient(uid, tier)
+                except Exception as e:
+                    log.info("insufficient-balance DM failed: %s", e)
+
+            # Tag-clear pass: every expired plus/pro row, cancelled or not, that
+            # hasn't had its tag cleared yet.
+            try:
+                with db() as conn:
+                    tag_rows = conn.execute(
+                        "SELECT uid FROM subs WHERE expires_at<=? AND expires_at>=? "
+                        "AND COALESCE(tag_cleared,0)=0 AND tier IN ('plus','pro')",
+                        (now, window)).fetchall()
+            except Exception:
+                tag_rows = []
+            for r in tag_rows:
+                uid = r["uid"] or ""
+                if not uid:
+                    continue
+                try:
+                    with db() as conn:
+                        conn.execute("UPDATE subs SET tag_cleared=1 WHERE uid=?", (str(uid),))
+                        conn.commit()
+                except Exception:
+                    pass
+                try:
+                    await _set_member_tag(uid, "free")
+                except Exception as e:
+                    log.info("member tag clear failed: %s", e)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.info("_bg_expire_subs error: %s", e)
 
 
 @app.get("/api/promos")
@@ -3767,6 +4815,7 @@ async def check_listings(payload: dict = Body(...)):
         return {"sold": []}
     items = items[:20]
     sold_ids = []
+    listed_ids = []
     now = time.time()
 
     async def _check(it):
@@ -3801,6 +4850,8 @@ async def check_listings(payload: dict = Body(...)):
         if cached and (now - cached[0]) < _LISTING_CHECK_TTL:
             if cached[1]:
                 sold_ids.append(iid)
+            else:
+                listed_ids.append(iid)
             return
 
         try:
@@ -3818,9 +4869,11 @@ async def check_listings(payload: dict = Body(...)):
         _listing_check_cache[cache_key] = (now, is_sold)
         if is_sold:
             sold_ids.append(iid)
+        else:
+            listed_ids.append(iid)
 
     await asyncio.gather(*[_check(it) for it in items], return_exceptions=True)
-    return {"sold": sold_ids}
+    return {"sold": sold_ids, "listed": listed_ids}
 
 
 @app.post("/api/promote/report")
@@ -3869,7 +4922,7 @@ async def star_balance(uid: str = Query(""), code: str = Query(""), x_init_data:
         if r and r.get("ok"):
             res = r.get("result") or {}
             stars = int(res.get("amount", res.get("star_amount", 0)) or 0)
-            gram = round(stars * STAR_TO_TON, 2) if STAR_TO_TON > 0 else None
+            gram = await _gram_from_stars(stars)
             return {"ok": True, "stars": stars, "nanostars": int(res.get("nanostar_amount", 0) or 0), "gram": gram}
         return {"ok": False, "error": (r or {}).get("description", "unavailable")}
     except Exception as e:
@@ -3886,22 +4939,24 @@ async def affiliate(x_init_data: str = Header(default="", alias="X-Init-Data")):
         return {"ok": False, "error": "auth"}
     tier = get_tier(uid)
     s = _affiliate_stats(uid)
-    ton_val = round(s["available"] * STAR_TO_TON, 4) if STAR_TO_TON > 0 else None
-    gram_val = round(s["available"] * STAR_TO_TON, 2) if STAR_TO_TON > 0 else None
+    gram_val = await _gram_from_stars(s["available"])
+    stars_usd_now = await _stars_usd_rate()
     return {
         "ok": True, "is_pro": tier == "pro", "pct": AFFILIATE_PCT,
         "min_withdraw": AFFILIATE_MIN_WITHDRAW,
         "earned": s["earned"], "paid": s["paid"], "pending": s["pending"],
         "available": s["available"], "referees": s["referees"], "payers": s["payers"],
-        "ton_value": ton_val, "gram_value": gram_val,
+        "ton_value": gram_val, "gram_value": gram_val,
         "payouts": _affiliate_payouts(uid), "series": _affiliate_series(uid),
-        "star_to_gram": STAR_TO_TON,
+        "star_to_gram": stars_usd_now,   # informational only; the real conversion is live, not a flat ratio
     }
 
 @app.post("/api/affiliate/withdraw")
 async def affiliate_withdraw(payload: dict = Body(...), x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Request a payout. Pro-only; needs >= AFFILIATE_MIN_WITHDRAW available Stars.
-    The amount is moved to 'pending' (escrow) until the team settles it in TON."""
+    The amount is immediately held as 'pending' (deducted from available), the
+    member gets an 'under review' DM, and the owner receives an interactive request
+    (user id, Stars + GRAM, wallet address) with Approve / Decline buttons."""
     uid = verify_init_data(x_init_data)
     if not uid:
         return {"ok": False, "error": "auth"}
@@ -3913,13 +4968,22 @@ async def affiliate_withdraw(payload: dict = Body(...), x_init_data: str = Heade
     s = _affiliate_stats(uid)
     if s["available"] < AFFILIATE_MIN_WITHDRAW:
         return {"ok": False, "error": "min", "available": s["available"], "min": AFFILIATE_MIN_WITHDRAW}
-    if not _affiliate_request_payout(uid, s["available"], addr):
+    stars = s["available"]
+    pid = _affiliate_request_payout(uid, stars, addr)
+    if not pid:
         return {"ok": False, "error": "failed"}
+    payout = {"id": pid, "uid": uid, "stars": stars, "ton_address": addr}
+    # 1) Tell the member it's under review (their balance is now held as pending).
     try:
-        await notify_admin(f"Affiliate payout requested: uid={uid} stars={s['available']} ton={addr}", level="info")
-    except Exception:
-        pass
-    return {"ok": True, "requested": s["available"]}
+        await _send_payout_under_review(uid, stars)
+    except Exception as e:
+        log.info("under-review DM failed: %s", e)
+    # 2) Send the owner the interactive Approve / Decline request.
+    try:
+        await _notify_admin_payout(payout, stats=s)
+    except Exception as e:
+        log.info("admin payout notify failed: %s", e)
+    return {"ok": True, "requested": stars, "gram": await _gram_from_stars(stars)}
 
 @app.post("/api/affiliate/mark-paid")
 async def affiliate_mark_paid(payload: dict = Body(...), code: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
@@ -3938,6 +5002,64 @@ async def affiliate_mark_paid(payload: dict = Body(...), code: str = Query(""), 
     except Exception as e:
         log.error("mark-paid failed: %s", e)
         return {"ok": False}
+
+
+@app.get("/api/admin/user-scan")
+async def admin_user_scan(target: str = Query(""), code: str = Query(""),
+                          x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Admin: authenticity scan for a user id (advisory signals + stats)."""
+    verified = verify_init_data(x_init_data)
+    code_ok = bool(ADMIN_CODE) and _clamp(code, 60) == ADMIN_CODE
+    id_ok = (verified is None) or (verified == ANALYTICS_ADMIN_ID)
+    if not (code_ok and id_ok):
+        return {"ok": False, "error": "forbidden"}
+    tgt = _digits(target)
+    if not tgt:
+        return {"ok": False, "error": "uid"}
+    try:
+        report = _user_authenticity(tgt)
+        report["ok"] = True
+        report["available_gram"] = await _gram_from_stars(report["stats"].get("available", 0))
+        return report
+    except Exception as e:
+        log.error("user-scan failed: %s", e)
+        return {"ok": False, "error": "failed"}
+
+
+@app.post("/api/admin/credit-stars")
+async def admin_credit_stars(payload: dict = Body(...), code: str = Query(""),
+                             x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Admin TEST tool: credit (or debit, with a negative amount) affiliate Stars to
+    a user id so the payout flow can be exercised end-to-end. Recorded as a normal
+    affiliate_earnings row tagged '__admin_credit__' so it's distinguishable from
+    real commission. Does NOT touch the user's real Telegram Star balance."""
+    verified = verify_init_data(x_init_data)
+    code_ok = bool(ADMIN_CODE) and _clamp(code, 60) == ADMIN_CODE
+    id_ok = (verified is None) or (verified == ANALYTICS_ADMIN_ID)
+    if not (code_ok and id_ok):
+        return {"ok": False, "error": "forbidden"}
+    tgt = _digits(payload.get("uid"))
+    try:
+        stars = int(payload.get("stars") or 0)
+    except Exception:
+        stars = 0
+    if not tgt or stars == 0:
+        return {"ok": False, "error": "input"}
+    stars = max(-1000000, min(1000000, stars))   # clamp magnitude for safety
+    try:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO affiliate_earnings(id, referrer, referee, tier, stars, charge_id, ts) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (_secrets.token_hex(8), tgt, "__admin_credit__", "test", stars, "admin", int(time.time())))
+            conn.commit()
+        s = _affiliate_stats(tgt)
+        return {"ok": True, "credited": stars, "uid": tgt,
+                "available": s["available"], "available_gram": await _gram_from_stars(s["available"]),
+                "earned": s["earned"]}
+    except Exception as e:
+        log.error("credit-stars failed: %s", e)
+        return {"ok": False, "error": "failed"}
 
 
 # ─── Cross-device sync: saved gifts + recent searches (verified users) ────────
@@ -4016,6 +5138,57 @@ async def _bot_api(method, payload):
     return await asyncio.to_thread(_do)
 
 
+# Community chats where Scout+/Scout Pro members get a visible group member tag.
+# This is Telegram's regular-member "Member Tags" feature (Bot API 9.5) — distinct
+# from admin custom titles, so the member does NOT need to be promoted to admin;
+# the BOT just needs the can_manage_tags admin right in each of these chats.
+# Tags only apply to people who are actually members of the chat, and a failure
+# in one chat never blocks the other.
+COMMUNITY_GROUP_IDS = [-1004432206418, -1003951015996]
+_TAG_BY_TIER = {"plus": "Scout+", "pro": "Scout Pro"}
+
+async def _set_member_tag(uid, tier):
+    """Set (or clear, if tier is falsy/free) this member's group tag in EVERY
+    community chat. Fire-and-forget from callers — failures are common and
+    harmless (the member simply isn't in that chat) and are never allowed to
+    slow down a payment or expiry sweep, so this only logs at info level and
+    never raises."""
+    tag = _TAG_BY_TIER.get(tier, "")
+    for chat_id in COMMUNITY_GROUP_IDS:
+        try:
+            resp = await _bot_api("setChatMemberTag", {
+                "chat_id": chat_id, "user_id": int(uid), "tag": tag,
+            })
+            if not (resp and resp.get("ok")):
+                log.info("setChatMemberTag skipped (chat=%s uid=%s tier=%s): %s", chat_id, uid, tier, resp)
+        except Exception as e:
+            log.info("setChatMemberTag failed (chat=%s uid=%s tier=%s): %s", chat_id, uid, tier, e)
+
+
+async def _backfill_member_tags():
+    """One-time pass (each cold start; cheap and idempotent) over every
+    currently-active plus/pro subscriber, so people who upgraded BEFORE the
+    member-tag feature shipped — or whose tag-set silently no-op'd because they
+    weren't a community member yet at the time — get tagged without waiting for
+    their next renewal. Runs once, off the request path, no recurring cost."""
+    try:
+        now = int(time.time())
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT uid, tier FROM subs WHERE expires_at>? AND tier IN ('plus','pro')",
+                (now,)).fetchall()
+        for r in rows:
+            uid = r["uid"] or ""
+            tier = r["tier"] or ""
+            if uid and tier:
+                await _set_member_tag(uid, tier)
+                await asyncio.sleep(0.05)   # gentle pacing, never a burst against the Bot API
+        if rows:
+            log.info("member-tag backfill: processed %d active subscriber(s)", len(rows))
+    except Exception as e:
+        log.info("member-tag backfill skipped: %s", e)
+
+
 @app.post("/api/userdata/clear")
 async def userdata_clear(x_init_data: str = Header(default="", alias="X-Init-Data")):
     """Self-serve data deletion: wipes the caller's synced data + referral rows.
@@ -4065,6 +5238,11 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
     market_url = _clamp(payload.get("marketUrl", ""), 256)
     if not market_url.startswith("https://"):
         market_url = ""
+    # The exact t.me gift link — used to hyperlink the gift name and to drive the
+    # message's link preview (so Telegram renders the gift's own card).
+    gift_url = _clamp(payload.get("giftUrl", ""), 256)
+    if not gift_url.startswith("https://t.me/"):
+        gift_url = ""
     # Build the GiftTrove deep-link HERE, server-side, stamping the sharer's
     # CURRENT referral code from our own records. We deliberately ignore any
     # link the client sent: the client value can carry a stale code (e.g. the
@@ -4077,48 +5255,77 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
     else:
         link = f"{MINIAPP_URL}?startapp={my_code}" if my_code else MINIAPP_URL
     _mid = " \u00b7 "
-    # Count the share the moment it's initiated — a share is a share whether
-    # Telegram serves the prepared card or the plain sheet.
-    track_share(name)
 
+    lang = _user_lang(uid)
+    hey = _t("share_hey", lang)
+    scout = _t("share_scout", lang)
+    open_lbl = _t("share_open", lang)
     title = f"{name}{(' #' + num) if num else ''}"
-    # No emoji: premium custom emoji do not render in prepared inline messages
-    # (Telegram falls back to the literal char), so we keep the card clean text.
-    segs = [("bold", title), ("text", "\n")]
-    segs.append(("text", f"{market}{(_mid + price) if price else ''}"))
-    segs.append(("text", "\n\nScout unique Telegram gifts on GiftTrove"))
-    # Two honestly-labeled links: one back into GiftTrove (so the recipient
-    # lands on this exact gift), one straight to the live marketplace listing.
+
+    # Localized share card (follows the sharer's language):
+    #   Hey! Check out {gift} {ID}
+    #   {marketplace} · {value} {currency}
+    #
+    #   Scout unique Telegram gifts on GiftTrove
+    #   Open in GiftTrove ✦ t.me
+    # "Open in GiftTrove" deep-links to this exact gift in the app; "t.me" is the
+    # normal gift link. A fixed banner image rides along with every share.
+    segs = [("text", hey), ("text", title)]
+    segs.append(("text", f"\n{market}{(_mid + price) if price else ''}"))
+    segs.append(("text", f"\n\n{scout}\n"))
+    foot = []
     if link:
-        segs.append(("text", "\n"))
-        segs.append(("link", "Open in GiftTrove", link))
-    if market_url:
-        segs.append(("text", "\n"))
-        segs.append(("link", f"View on {market}", market_url))
+        foot.append(("link", open_lbl, link))
+    if gift_url:
+        foot.append(("link", "t.me", gift_url))
+    for i, seg in enumerate(foot):
+        if i:
+            segs.append(("text", " \u2726 "))
+        segs.append(seg)
 
     text, off, entities = "", 0, []
     for seg in segs:
         s = seg[1]
         ln = _u16len(s)
-        if seg[0] == "bold":
-            entities.append({"type": "bold", "offset": off, "length": ln})
-        elif seg[0] == "link":
+        if seg[0] == "link":
             entities.append({"type": "text_link", "offset": off, "length": ln, "url": seg[2]})
         text += s
         off += ln
 
     import uuid as _uuid
-    result = {
-        "type": "article",
-        "id": _uuid.uuid4().hex[:32],
-        "title": title,
-        "description": (market + (_mid + price if price else "")).strip(),
-        "input_message_content": {
-            "message_text": text,
-            "entities": entities,
-            "link_preview_options": {"is_disabled": True},
-        },
-    }
+    _rid = _uuid.uuid4().hex[:32]
+    # Try to reuse a pre-uploaded Telegram file_id (cached_photo) so the banner
+    # is served from Telegram's CDN — eliminates the half-loaded image.
+    # If upload hasn't happened yet, fall back to article (the reliable format)
+    # so shares always work, even on first cold-start call before the banner is
+    # cached. (photo_url requires JPEG; our banner is PNG so that path = 400.)
+    fid = None
+    try:
+        fid = await _ensure_share_photo_fid()
+    except Exception:
+        pass
+    if fid:
+        result = {
+            "type": "cached_photo",
+            "id": _rid,
+            "photo_file_id": fid,
+            "caption": text,
+            "caption_entities": entities,
+        }
+    else:
+        # Article fallback: no image, but shares work cleanly on every cold start.
+        mid_line = f"{market}{(_mid + price) if price else ''}"
+        result = {
+            "type": "article",
+            "id": _rid,
+            "title": title,
+            "description": mid_line,
+            "input_message_content": {
+                "message_text": text,
+                "entities": entities,
+                "link_preview_options": {"is_disabled": True},
+            },
+        }
     try:
         resp = await _bot_api("savePreparedInlineMessage", {
             "user_id": int(uid),
@@ -4129,6 +5336,12 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
             "allow_bot_chats": False,
         })
         if resp and resp.get("ok") and (resp.get("result") or {}).get("id"):
+            # Count the share off the critical path so the DB write doesn't delay
+            # the share prompt from popping up.
+            try:
+                asyncio.create_task(asyncio.to_thread(track_share, name))
+            except Exception:
+                pass
             return {"ok": True, "id": resp["result"]["id"]}
         desc = (resp or {}).get("description", "prepare_failed")
         log.error("savePreparedInlineMessage failed: %s", resp)
