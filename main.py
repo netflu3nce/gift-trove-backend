@@ -106,7 +106,14 @@ STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
 # backend base URL for its calls, but LottieGift does a plain fetch(src) on
 # whatever string is in `animation`/`image` — a bare relative path there would
 # resolve against the FRONTEND's own domain (Vercel), not this backend.
-BACKEND_PUBLIC_URL = (os.getenv("RENDER_EXTERNAL_URL", "") or "https://betatest-rjhx.onrender.com").rstrip("/")
+BACKEND_PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+if not BACKEND_PUBLIC_URL:
+    log.warning(
+        "RENDER_EXTERNAL_URL not set — this backend doesn't know its own public "
+        "URL. The Telegram-sourced image/animation fallback (model-anim URLs) "
+        "will be skipped rather than guess at a domain that might belong to a "
+        "DIFFERENT deployment (beta vs. production)."
+    )
 GETGEMS_API_KEY = os.getenv("GETGEMS_API_KEY", "")
 GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 # MarketApp aggregator (Tonnel / Portals / Fragment / GetGems / MarketApp).
@@ -115,10 +122,17 @@ GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 # endpoint can be corrected from their Swagger without a code change.
 MARKETAPP_TOKEN = os.getenv("MARKETAPP_TOKEN", "")
 MARKETAPP_BASE = os.getenv("MARKETAPP_BASE", "https://api.marketapp.org").rstrip("/")
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://gift-trove-frontend.vercel.app,https://trovebeta.vercel.app"
-).split(",") if o.strip()]
+_KNOWN_FRONTEND_ORIGINS = [
+    "https://gift-trove-frontend.vercel.app",  # main/production
+    "https://trovebeta.vercel.app",            # beta
+]
+_env_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+# Union, not replace: an ALLOWED_ORIGINS env var (e.g. set before a new domain
+# existed) can only ADD origins here, never silently drop one of the two
+# known frontends. That silent-drop is exactly what breaks "beta still works,
+# production doesn't" — both domains are always safe regardless of what's
+# actually configured in the env var.
+ALLOWED_ORIGINS = list(dict.fromkeys(_KNOWN_FRONTEND_ORIGINS + _env_origins))
 DB_PATH = os.getenv("DB_PATH", "gifttrove.db")
 # Durable storage: if DATABASE_URL (Postgres, e.g. Neon) is set, use it so data
 # survives redeploys. Otherwise fall back to local SQLite (ephemeral on Render).
@@ -2773,6 +2787,13 @@ app = FastAPI(title="GiftTrove API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS or ["*"],
+    # Vercel serves the same project under several valid URLs (the custom
+    # domain, and auto-generated per-deployment/preview URLs) — an exact-match
+    # allow_origins list breaks the instant a request comes from any of those
+    # OTHER valid URLs, which is exactly what "beta works, production doesn't"
+    # looks like. This regex covers any vercel.app subdomain as a safety net
+    # on top of the explicit list above.
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -4409,7 +4430,7 @@ async def search(
                     if uri:
                         item["imageFallback"] = uri
                     anim_did = anim_by_docid.get(did)
-                    if anim_did is not None:
+                    if anim_did is not None and BACKEND_PUBLIC_URL:
                         item["animationFallback"] = f"{BACKEND_PUBLIC_URL}/api/model-anim/{anim_did}"
             # Symbol pattern overlay: Telegram's bare model document is only the
             # character shape — no backdrop colour, no symbol pattern, unlike
