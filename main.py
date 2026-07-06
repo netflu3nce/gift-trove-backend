@@ -6,6 +6,7 @@ import os
 import re
 import time
 import json
+import gzip
 import asyncio
 import sqlite3
 import logging
@@ -28,6 +29,9 @@ log = logging.getLogger("gifttrove")
 _SENSITIVE_ENV_KEYS = (
     "BOT_TOKEN", "API_HASH", "API_ID", "STRING_SESSION", "DATABASE_URL",
     "MARKETAPP_TOKEN", "ACCESS_CODE", "ADMIN_CODE",
+    "STRING_SESSION_2", "STRING_SESSION_3", "STRING_SESSION_4", "STRING_SESSION_5",
+    "API_ID_2", "API_ID_3", "API_ID_4", "API_ID_5",
+    "API_HASH_2", "API_HASH_3", "API_HASH_4", "API_HASH_5",
 )
 _BOT_TOKEN_RE = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b")
 
@@ -96,6 +100,13 @@ except Exception:
 API_ID = os.getenv("API_ID", "")
 API_HASH = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("STRING_SESSION", "").strip()
+# This backend's own public URL — Render sets RENDER_EXTERNAL_URL automatically.
+# Needed anywhere we hand the frontend a URL pointing back at OURSELVES (like
+# /api/model-anim/<id> below): the frontend's api() helper prefixes its own
+# backend base URL for its calls, but LottieGift does a plain fetch(src) on
+# whatever string is in `animation`/`image` — a bare relative path there would
+# resolve against the FRONTEND's own domain (Vercel), not this backend.
+BACKEND_PUBLIC_URL = (os.getenv("RENDER_EXTERNAL_URL", "") or "https://betatest-rjhx.onrender.com").rstrip("/")
 GETGEMS_API_KEY = os.getenv("GETGEMS_API_KEY", "")
 GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 # MarketApp aggregator (Tonnel / Portals / Fragment / GetGems / MarketApp).
@@ -1851,8 +1862,37 @@ async def _daily_digest_loop():
 
 
 # ─── Telethon client lifecycle ────────────────────────────────────────────────
-client = None
+client = None      # the one MTProto user session
 bot = None
+
+# ─── Single MTProto session ────────────────────────────────────────────────
+# The multi-session pool experiment (5 accounts sharing load) is removed.
+# In practice 4 of 5 accounts kept getting rejected by Telegram at the
+# transport level (TCP connects fine, then Telegram's server returns a
+# malformed response instead of completing auth) no matter what retry or
+# pooling logic wrapped around them — that's an external rejection, not
+# something client-side code can fix. Worse, round-robin picking one of
+# those dead sessions on every other call was actively making searches
+# SLOWER and less reliable than just using the one session that works.
+# Back to a single, simple, reliable session.
+class _SessionStatus:
+    def __init__(self):
+        self.error = ""
+        self.verified = False   # true only after an ACTUAL successful call —
+                                 # is_connected() alone isn't a reliable signal
+        self.last_flood_at = 0.0   # epoch seconds of the most recent flood wait
+
+    @property
+    def under_pressure(self):
+        """True if we hit a flood wait recently. Optional/enhancement work
+        (per-search image & animation fetching) should back off entirely
+        while this is true — piling more MTProto calls onto an already
+        rate-limited session just makes the core search/attribute fetches
+        that actually matter fail more too."""
+        return (time.time() - self.last_flood_at) < 45
+
+
+_session = _SessionStatus()
 
 
 # ─── Inline mode: warm floor cache + fast lookups ────────────────────────────
@@ -2585,7 +2625,7 @@ async def _notify_admin_payout(payout, stats=None):
 
 
 async def _connect_user_session():
-    """(Re)connect the user session. Returns True on success."""
+    """(Re)connect the single user session. Returns True on success."""
     global client, _mtproto_error
     if not (TELETHON_OK and API_ID and API_HASH and STRING_SESSION):
         _mtproto_error = (
@@ -2597,7 +2637,7 @@ async def _connect_user_session():
     try:
         if client is None:
             client = TelegramClient(StringSession(STRING_SESSION), int(API_ID), API_HASH)
-            # Auto-sleep only for short waits; longer floods raise (we catch them)
+            # Auto-sleep only for short waits; longer floods raise (we catch them).
             client.flood_sleep_threshold = 5
         if not client.is_connected():
             await asyncio.wait_for(client.connect(), timeout=20)
@@ -2608,15 +2648,15 @@ async def _connect_user_session():
         _mtproto_error = ""
         return True
     except Exception as e:
-        _mtproto_error = str(e)
-        log.error("MTProto connect failed: %s", e)
+        _mtproto_error = f"{type(e).__name__}: {e}"
+        log.error("MTProto connect failed: %s: %r", type(e).__name__, e)
         return False
 
 
 async def background_telethon_initializer():
     """Connect Telethon in the background (so Uvicorn binds the port instantly),
     then keep the connection warm with a keepalive loop."""
-    global bot
+    global bot, _mtproto_error
 
     # 1) User session (with one retry)
     for attempt in (1, 2):
@@ -2626,8 +2666,10 @@ async def background_telethon_initializer():
             try:
                 me = await asyncio.wait_for(client.get_me(), timeout=20)
                 log.info("MTProto session live as @%s", getattr(me, "username", me.id))
+                _session.verified = True
             except Exception as e:
-                log.warning("get_me after connect failed: %s", e)
+                log.warning("get_me after connect failed: %r", e)
+                _session.verified = False
             break
         if attempt == 1:
             await asyncio.sleep(5)
@@ -2663,6 +2705,7 @@ async def background_telethon_initializer():
         asyncio.create_task(_bg_expire_subs())
         asyncio.create_task(_warm_inline_floors())
         asyncio.create_task(_bg_warm_attributes())
+        asyncio.create_task(_bg_refresh_collections_loop())
         # One-time backfill: members who were already on an active plus/pro
         # subscription BEFORE the member-tag feature shipped only get tagged at
         # their next payment event otherwise (up to 30 days away). Catch them now.
@@ -2673,7 +2716,8 @@ async def background_telethon_initializer():
         asyncio.create_task(_daily_digest_loop())
         asyncio.create_task(notify_admin(
             f"Backend deployed and live.\nDB: {'Postgres' if USE_PG else 'SQLite'}.\n"
-            f"MTProto session: {'connected' if (client and client.is_connected()) else 'offline'}. Bot: online.",
+            f"MTProto session: {'connected and verified' if (client and client.is_connected() and _session.verified) else 'offline'}. "
+            f"Bot: online.",
             level="good",
         ))
     except Exception as e:
@@ -2689,9 +2733,11 @@ async def background_telethon_initializer():
                     await asyncio.wait_for(client.connect(), timeout=20)
                 if client is not None:
                     await asyncio.wait_for(client.get_me(), timeout=20)
+                    _session.verified = True
             _mtproto_error = "" if client and client.is_connected() else _mtproto_error
         except Exception as e:
             log.warning("keepalive: connection looked dead (%s) — reconnecting", e)
+            _session.verified = False
             try:
                 if client is not None:
                     try:
@@ -2715,7 +2761,7 @@ async def lifespan(app: FastAPI):
     init_task = asyncio.create_task(background_telethon_initializer())
     yield
     init_task.cancel()
-    for c in (client, bot):
+    for c in [client, bot]:
         if c:
             try:
                 await c.disconnect()
@@ -2788,15 +2834,19 @@ async def _invoke(build, timeout=None):
             try:
                 if not client.is_connected():
                     await asyncio.wait_for(client.connect(), timeout=15)
-                return await asyncio.wait_for(client(build()), timeout=timeout)
+                result = await asyncio.wait_for(client(build()), timeout=timeout)
+                _session.verified = True
+                return result
             except FloodWaitError as e:
                 # Rate-limited by Telegram. Reconnecting won't help — bail out
                 # so the handler can serve cache / empty instead of cascading.
+                _session.last_flood_at = time.time()
                 log.warning("flood wait %ss on MTProto call — skipping", getattr(e, "seconds", "?"))
                 raise
             except Exception as e:
                 last = e
-                log.error("MTProto invoke attempt %d failed: %s", attempt, repr(e))
+                _session.verified = False
+                log.error("MTProto invoke attempt %d failed: %s: %r", attempt, type(e).__name__, e)
                 if attempt == 1:
                     try:
                         await client.disconnect()
@@ -2805,7 +2855,7 @@ async def _invoke(build, timeout=None):
                     try:
                         await asyncio.wait_for(client.connect(), timeout=15)
                     except Exception as e2:
-                        log.error("reconnect failed: %s", repr(e2))
+                        log.error("reconnect failed: %s: %r", type(e2).__name__, e2)
     raise last if last else RuntimeError("MTProto invoke failed")
 
 
@@ -2867,8 +2917,9 @@ def _stripped_data_uri(doc):
 import base64 as _b64mod
 
 _thumb_cache = {}
-_thumb_sem = asyncio.Semaphore(8)
 
+
+_thumb_sem = asyncio.Semaphore(3)
 
 async def _doc_thumb_uri(doc):
     did = getattr(doc, "id", None)
@@ -2877,25 +2928,32 @@ async def _doc_thumb_uri(doc):
     if did in _thumb_cache:
         return _thumb_cache[did]
     raw = None
+    thumbs = getattr(doc, "thumbs", None) or []
+    # Prefer the smallest REAL PhotoSize (has w/h, no inline bytes) —
+    # crisp enough for icons without multi-MB payloads.
+    real = [t for t in thumbs if getattr(t, "w", 0) and not getattr(t, "bytes", None)]
+    pick = min(real, key=lambda t: getattr(t, "w", 10**6)) if real else None
+    if pick is None and not thumbs:
+        return None
     try:
-        thumbs = getattr(doc, "thumbs", None) or []
-        # Prefer the smallest REAL PhotoSize (has w/h, no inline bytes) —
-        # crisp enough for icons without multi-MB payloads.
-        real = [t for t in thumbs if getattr(t, "w", 0) and not getattr(t, "bytes", None)]
-        pick = min(real, key=lambda t: getattr(t, "w", 10**6)) if real else None
-        if client is not None and (pick is not None or thumbs):
+        if client is not None:
+            if not client.is_connected():
+                await asyncio.wait_for(client.connect(), timeout=10)
             async with _thumb_sem:
                 try:
                     raw = await asyncio.wait_for(
                         client.download_media(doc, file=bytes, thumb=pick if pick is not None else -1),
-                        timeout=20,
+                        timeout=15,
                     )
                 except TypeError:
                     raw = await asyncio.wait_for(
-                        client.download_media(doc, file=bytes, thumb=-1), timeout=20
+                        client.download_media(doc, file=bytes, thumb=-1), timeout=15
                     )
     except Exception as e:
+        if isinstance(e, FloodWaitError):
+            _session.last_flood_at = time.time()
         log.info("thumb download skipped: %s", e)
+        raw = None
     uri = None
     if raw:
         head = bytes(raw[:8])
@@ -2908,6 +2966,79 @@ async def _doc_thumb_uri(doc):
     if uri and len(_thumb_cache) < 8000:
         _thumb_cache[did] = uri
     return uri
+
+
+_anim_cache = {}   # doc_id -> decompressed Lottie JSON bytes, or False if confirmed unavailable
+
+async def _doc_anim_json(doc):
+    """
+    Fetch a model attribute's FULL document (not just its thumbnail) and, if
+    it's a TGS file, decompress it to raw Lottie JSON.
+
+    TGS is Telegram's own animated-sticker format, and by Telegram's own
+    published spec a .tgs file IS a gzip-compressed Lottie animation — the
+    exact same JSON format LottieGift already plays everywhere else in this
+    app. So when a gift's model document turns out to be TGS, we get a real
+    Telegram-sourced ANIMATION, not just a static thumbnail — available the
+    instant the gift exists, with zero dependency on Fragment ever crawling
+    the collection.
+
+    Detection is by gzip's own magic bytes (0x1f 0x8b), not by trusting a
+    mime_type string, since that's a format guarantee rather than metadata
+    that could be missing or wrong.
+
+    Returns decompressed JSON bytes, or None if this document isn't TGS (a
+    plain static-image model — nothing wrong, just nothing to animate).
+    """
+    did = getattr(doc, "id", None)
+    if did is None:
+        return None
+    cached = _anim_cache.get(did)
+    if cached is not None:
+        return cached if cached is not False else None
+    raw = None
+    transient_failure = False
+    try:
+        if client is not None:
+            if not client.is_connected():
+                await asyncio.wait_for(client.connect(), timeout=10)
+            async with _thumb_sem:
+                raw = await asyncio.wait_for(client.download_media(doc, file=bytes), timeout=15)
+    except Exception as e:
+        if isinstance(e, FloodWaitError):
+            _session.last_flood_at = time.time()
+        log.info("anim download skipped: %s", e)
+        raw = None
+        transient_failure = True
+    if not raw or raw[:2] != b"\x1f\x8b":
+        if not transient_failure:
+            _anim_cache[did] = False   # confirmed not TGS — don't retry every request
+        return None
+    try:
+        data = gzip.decompress(bytes(raw))
+        json.loads(data)   # validate it's real JSON before trusting/caching it
+    except Exception as e:
+        log.info("anim decompress failed for doc %s: %s", did, e)
+        _anim_cache[did] = False
+        return None
+    if len(_anim_cache) < 2000:
+        _anim_cache[did] = data
+    return data
+
+
+@app.get("/api/model-anim/{doc_id}")
+async def model_anim(doc_id: int):
+    """Serves the decompressed Lottie JSON cached by _doc_anim_json above.
+    This is what item["animation"] points to for gifts whose model turned out
+    to be a real TGS animation — the frontend's LottieGift already just does
+    a plain fetch(src) on whatever URL is in `animation`, so no frontend
+    change was needed to consume this."""
+    data = _anim_cache.get(doc_id)
+    if not data or data is False:
+        return JSONResponse(status_code=404, content={"error": "not_available"})
+    from fastapi.responses import Response
+    return Response(content=data, media_type="application/json",
+                     headers={"Cache-Control": "public, max-age=604800, immutable"})
 
 
 def _attr_id(a):
@@ -2995,19 +3126,32 @@ def _extract_price(g):
 
 
 def _gift_attrs(g):
-    model = model_rarity = symbol = backdrop = backdrop_hex = None
+    model = model_rarity = symbol = symbol_rarity = backdrop = backdrop_rarity = backdrop_hex = model_doc = None
     for a in getattr(g, "attributes", []) or []:
         cls = type(a).__name__
         rar = getattr(a, "rarity_permille", None)
         rar = round(rar / 10, 2) if isinstance(rar, (int, float)) else None
         if cls == "StarGiftAttributeModel":
             model, model_rarity = getattr(a, "name", None), rar
+            model_doc = getattr(a, "document", None)
         elif cls == "StarGiftAttributePattern":
-            symbol = getattr(a, "name", None)
+            symbol, symbol_rarity = getattr(a, "name", None), rar
         elif cls == "StarGiftAttributeBackdrop":
-            backdrop = getattr(a, "name", None)
+            backdrop, backdrop_rarity = getattr(a, "name", None), rar
             backdrop_hex = color_hex(getattr(a, "center_color", None))
-    return model, model_rarity, symbol, backdrop, backdrop_hex
+    return model, model_rarity, symbol, symbol_rarity, backdrop, backdrop_rarity, backdrop_hex, model_doc
+
+
+def _model_doc_of(g):
+    """The exact per-item model document Telegram embeds directly on this
+    specific unique gift — NOT the collection-wide attribute list. This is
+    what lets us show the correct model artwork straight from Telegram,
+    available the instant a gift exists (no dependency on Fragment having
+    crawled/indexed the collection yet)."""
+    for a in getattr(g, "attributes", []) or []:
+        if type(a).__name__ == "StarGiftAttributeModel":
+            return getattr(a, "document", None)
+    return None
 
 
 def serialize_unique(g):
@@ -3015,7 +3159,7 @@ def serialize_unique(g):
     title = getattr(g, "title", None) or "Gift"
     slug = getattr(g, "slug", None) or _slug_from_title(title)
     base = cdn_full(slug, num)
-    model, model_rarity, symbol, backdrop, backdrop_hex = _gift_attrs(g)
+    model, model_rarity, symbol, symbol_rarity, backdrop, backdrop_rarity, backdrop_hex, _model_doc = _gift_attrs(g)
     price, currency, gram_value = _extract_price(g)
     return {
         "id": str(getattr(g, "id", base)),
@@ -3025,7 +3169,9 @@ def serialize_unique(g):
         "model": model,
         "modelRarity": model_rarity,
         "symbol": symbol,
+        "symbolRarity": symbol_rarity,
         "backdrop": backdrop,
+        "backdropRarity": backdrop_rarity,
         "backdropHex": backdrop_hex,
         "price": price,
         "currency": currency,
@@ -3049,8 +3195,8 @@ def _frag_item(tg_slug, gift_name, num, price, fslug):
         "slug": base,
         "num": int(num),
         "name": gift_name or tg_slug,
-        "model": None, "modelRarity": None, "symbol": None,
-        "backdrop": None, "backdropHex": None,
+        "model": None, "modelRarity": None, "symbol": None, "symbolRarity": None,
+        "backdrop": None, "backdropRarity": None, "backdropHex": None,
         "price": price, "currency": "TON", "gram_value": (float(price) if price is not None else None),
         "market": "Fragment",
         "url": f"https://fragment.com/gift/{fslug}-{num}",
@@ -3256,6 +3402,18 @@ def _marketapp_item(raw, gift_name, fallback_slug, gift_id=None):
         num = int(num) if num is not None else None
     except Exception:
         num = None
+    if num is None:
+        # MarketApp doesn't actually return a separate item-number field — the
+        # number only exists as the "#NNNN" suffix on "name" (e.g. "Plush Pepe
+        # #476"). Without this, num stayed None for every MarketApp item, which
+        # meant no CDN image/animation URL could ever be built for them — the
+        # empty-box placeholder the user was seeing was 100% of MarketApp results.
+        _m = _re.search(r"#(\d+)\s*$", str(raw.get("name") or ""))
+        if _m:
+            try:
+                num = int(_m.group(1))
+            except Exception:
+                num = None
     # min_bid / max_bid are integer-string amounts in the listing's OWN currency,
     # scaled by that currency's decimals: TON/GRAM = 9 decimals (nanotons),
     # USDT = 6 decimals. For a fixed-price sale min_bid == max_bid; for an auction
@@ -3403,8 +3561,8 @@ async def getgems_search(gift_name, limit=12, collection_address=None):
         out.append({
             "id": addr, "slug": None, "num": None,
             "name": n.get("name") or gift_name,
-            "model": None, "modelRarity": None, "symbol": None,
-            "backdrop": None, "backdropHex": None,
+            "model": None, "modelRarity": None, "symbol": None, "symbolRarity": None,
+            "backdrop": None, "backdropRarity": None, "backdropHex": None,
             "price": price, "currency": "TON", "gram_value": (float(price) if price is not None else None), "market": "GetGems",
             "url": f"https://getgems.io/nft/{addr}" if addr else None,
             "image": img, "animation": None,
@@ -3417,7 +3575,7 @@ async def getgems_search(gift_name, limit=12, collection_address=None):
 async def health():
     resp = {
         "ok": True,
-        "mtproto": bool(client and client.is_connected()),
+        "mtproto": bool(client and client.is_connected() and _session.verified),
         "getgems": bool(GETGEMS_API_KEY),
         "marketapp": bool(MARKETAPP_TOKEN),
         "cached_collections": bool(cache_get("collections")),
@@ -3451,6 +3609,7 @@ async def debug():
     """Hang-proof diagnostics. Open in a browser to see exactly what's happening."""
     info = {
         "mtproto_connected": bool(client and client.is_connected()),
+        "mtproto_verified": _session.verified,
         "mtproto_error": _mtproto_error or None,
         "tl_GetStarGifts": _payments("GetStarGiftsRequest") is not None,
         "tl_GetResaleStarGifts": _payments("GetResaleStarGiftsRequest") is not None,
@@ -3557,6 +3716,20 @@ async def _build_collections():
     return [c for c in out if c["gift_id"]]
 
 
+async def _warm_new_collections(gift_ids):
+    """Fire-and-forget: fetch attributes for collections that just appeared,
+    right away, instead of leaving them to wait for the next scheduled
+    _bg_warm_attributes sweep (which can be hours away). Same gentle pacing
+    philosophy as that loop — never burst MTProto."""
+    for gid in gift_ids:
+        try:
+            await _fetch_attributes_live(gid)
+            log.info("attributes warmed immediately for new collection (gift_id=%s)", gid)
+        except Exception as e:
+            log.info("immediate attr warm failed for new collection (gift_id=%s): %s", gid, e)
+        await asyncio.sleep(4)
+
+
 async def _refresh_collections_bg():
     """Background rebuild → memory + durable Postgres copy."""
     global _collections_refreshing
@@ -3564,11 +3737,23 @@ async def _refresh_collections_bg():
         return
     _collections_refreshing = True
     try:
+        prev = _collections_db_get() or []
+        prev_ids = {str(c.get("gift_id")) for c in prev if c.get("gift_id")}
         out = await _build_collections()
         if out:
+            new_ones = [c for c in out if str(c.get("gift_id")) not in prev_ids]
+            gone_ones = [c["name"] for c in prev if str(c.get("gift_id")) not in {str(x.get("gift_id")) for x in out}]
             cache_set("collections", out, ttl=900)
             _collections_db_set(out)
-            log.info("collections refreshed (%d items)", len(out))
+            if new_ones or gone_ones:
+                log.info("collections refreshed (%d items) — NEW: %s | REMOVED: %s",
+                          len(out), [c["name"] for c in new_ones] or "none", gone_ones or "none")
+                if new_ones:
+                    new_gift_ids = [str(c.get("gift_id")) for c in new_ones if c.get("gift_id")]
+                    if new_gift_ids:
+                        asyncio.create_task(_warm_new_collections(new_gift_ids))
+            else:
+                log.info("collections refreshed (%d items) — no changes", len(out))
     except Exception as e:
         log.info("collections bg refresh skipped: %s", e)
     finally:
@@ -3784,6 +3969,13 @@ async def _fetch_attributes_live(gift_id):
                 _BACKDROP_HEX[name.strip().lower()] = _bd_hex   # universal colour
             if name and aid is not None:
                 id_map["backdrop"][name] = aid
+    log.info(
+        "attributes RARITY sample for gift_id=%s — models: %s | symbols: %s | backdrops: %s",
+        gift_id,
+        [(m["name"], m["rarity"]) for m in models[:5]],
+        [(s["name"], s["rarity"]) for s in symbols[:5]],
+        [(b["name"], b["rarity"]) for b in backdrops[:5]],
+    )
     # Real images for models + symbols, fetched in parallel (cached).
     imgs = await asyncio.gather(
         *[_doc_thumb_uri(d) for d in model_docs + symbol_docs],
@@ -3844,6 +4036,29 @@ async def attributes(request: Request, gift_id: str = Query(...),
     empty = {"models": [], "symbols": [], "backdrops": []}
     try:
         return await _fetch_attributes_live(gift_id)
+    except FloodWaitError as e:
+        wait_s = float(getattr(e, "seconds", 999) or 999)
+        if wait_s <= 8:
+            # Short wait — worth eating the delay once and self-healing rather
+            # than permanently serving stale/empty for something that would've
+            # worked moments later. Longer waits fall through to the stale path
+            # below rather than making a real user sit through it.
+            try:
+                await asyncio.sleep(wait_s + 0.3)
+                return await _fetch_attributes_live(gift_id)
+            except Exception as e2:
+                log.error("attributes retry-after-flood-wait failed: %s", e2)
+        else:
+            log.error("attributes flood wait too long to retry live (%.0fs): %s", wait_s, e)
+        stale = _attrs_stale.get(str(gift_id))
+        if stale:
+            return stale
+        db_payload, _ = _attrs_db_get(gift_id)
+        if db_payload and isinstance(db_payload, dict) and db_payload.get("resp"):
+            if db_payload.get("ids"):
+                _attr_ids_cache[str(gift_id)] = _idmap_from_jsonable(db_payload["ids"])
+            return db_payload["resp"]
+        return {**empty, "error": str(e)}
     except Exception as e:
         log.error("attributes error: %s", e)
         # Transient MTProto hiccup: serve the last good copy (memory, then
@@ -3857,6 +4072,26 @@ async def attributes(request: Request, gift_id: str = Query(...),
                 _attr_ids_cache[str(gift_id)] = _idmap_from_jsonable(db_payload["ids"])
             return db_payload["resp"]
         return {**empty, "error": str(e)}
+
+
+async def _bg_refresh_collections_loop():
+    """Recurring, traffic-INDEPENDENT check for new/changed collections.
+    Before this, a refresh only ever happened when a real request happened to
+    land right as the 15-minute in-memory cache expired — during a quiet
+    period (e.g. overnight) nothing would re-trigger a check for a long time,
+    which is exactly why a brand-new Telegram collection needed a manual
+    redeploy to show up. This loop calls the same guarded refresh on a fixed
+    clock instead, so new collections surface within one cycle of Telegram
+    actually publishing them — no deploy required."""
+    while True:
+        try:
+            await asyncio.sleep(900)   # every 15 minutes
+            await _refresh_collections_bg()   # already no-ops if a refresh is mid-flight
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.info("_bg_refresh_collections_loop error: %s", e)
+            await asyncio.sleep(300)
 
 
 async def _bg_warm_attributes():
@@ -3880,15 +4115,49 @@ async def _bg_warm_attributes():
                 if not gid:
                     continue
                 try:
-                    _, db_ts = _attrs_db_get(gid)
+                    old_payload, db_ts = _attrs_db_get(gid)
                     fresh_until = db_ts + _ATTRS_DB_TTL - _ATTRS_WARM_MARGIN
                     if db_ts and time.time() < fresh_until:
                         continue   # already fresh enough, skip
-                    await _fetch_attributes_live(gid)
+                    old_resp = (old_payload or {}).get("resp") or {}
+                    old_names = {
+                        k: {m.get("name") for m in (old_resp.get(k) or []) if m.get("name")}
+                        for k in ("models", "symbols", "backdrops")
+                    }
+                    new_resp = await _fetch_attributes_live(gid)
+                    new_names = {
+                        k: {m.get("name") for m in (new_resp.get(k) or []) if m.get("name")}
+                        for k in ("models", "symbols", "backdrops")
+                    }
+                    if old_resp:
+                        added = {k: sorted(new_names[k] - old_names[k]) for k in new_names}
+                        removed = {k: sorted(old_names[k] - new_names[k]) for k in new_names}
+                        if any(added.values()) or any(removed.values()):
+                            coll_name = c.get("name") or gid
+                            log.info(
+                                "attributes CHANGED for %s (gift_id=%s) — new models: %s | new symbols: %s | "
+                                "new backdrops: %s | removed models: %s | removed symbols: %s | removed backdrops: %s",
+                                coll_name, gid,
+                                added["models"] or "none", added["symbols"] or "none", added["backdrops"] or "none",
+                                removed["models"] or "none", removed["symbols"] or "none", removed["backdrops"] or "none",
+                            )
                     warmed += 1
+                    await asyncio.sleep(4)   # gentle pacing — never burst MTProto
+                except FloodWaitError as e:
+                    # Telegram is genuinely rate-limiting us right now. The old
+                    # behaviour moved on after only 4s regardless — walking
+                    # straight into the SAME still-active flood window on the
+                    # very next collection, which cascaded into several
+                    # collections in a row failing within seconds of each other
+                    # (exactly what showed up in the logs). Actually wait out
+                    # the real remaining duration (capped, so one huge wait
+                    # can't stall the whole pass for minutes) before continuing.
+                    wait_s = min(float(getattr(e, "seconds", 20) or 20), 45)
+                    log.info("attr warm backing off %.0fs after flood wait (gift_id=%s)", wait_s, gid)
+                    await asyncio.sleep(wait_s)
                 except Exception as e:
                     log.info("attr warm skipped for gift_id=%s: %s", gid, e)
-                await asyncio.sleep(4)   # gentle pacing — never burst MTProto
+                    await asyncio.sleep(4)
             if warmed:
                 log.info("attribute warm pass: refreshed %d/%d collection(s)", warmed, len(colls))
             await asyncio.sleep(6 * 3600)   # next pass in 6 hours
@@ -4060,6 +4329,7 @@ async def search(
         try:
             cur = offset or ""
             fetched = 0
+            native_docs = {}   # item id -> raw model document (for the batch fetch below)
             # Page through Telegram's resale listings until we hit `limit`
             # (the API returns a chunk + next_offset; we follow the cursor).
             for _ in range(20):  # safety cap on pages
@@ -4084,12 +4354,85 @@ async def search(
                     if not _attr_match(item):
                         continue
                     results.append(item)
+                    doc = _model_doc_of(g)
+                    if doc is not None:
+                        native_docs[item["id"]] = doc
                 fetched += len(chunk)
                 cur = getattr(res, "next_offset", "") or ""
                 next_offset = cur
                 if not cur or len(chunk) == 0:
                     next_offset = ""
                     break
+            # Swap in the EXACT per-item model artwork, sourced directly from
+            # Telegram, in place of the Fragment-CDN guess — this is what fixes
+            # a brand-new collection showing the wrong/generic image (Fragment
+            # hasn't crawled it yet) or a broken-image placeholder. Deduplicated
+            # by document id first: many listings share the same model, so a
+            # collection with, say, 30 results across 8 distinct models only
+            # costs 8 fetches, not 30 — and _thumb_cache makes every fetch after
+            # the very first search of this collection free for everyone.
+            if native_docs and not _session.under_pressure:
+                uniq = {}
+                for doc in native_docs.values():
+                    did = getattr(doc, "id", None)
+                    if did is not None and did not in uniq:
+                        uniq[did] = doc
+                    if len(uniq) >= 10:   # cap worst-case load per search — a
+                        break             # collection's distinct-model count is
+                                          # usually well under this anyway; this
+                                          # just bounds the rare chunky case
+                thumbs = await asyncio.gather(*[_doc_thumb_uri(d) for d in uniq.values()], return_exceptions=True)
+                by_docid = {did: (uri if isinstance(uri, str) else None) for did, uri in zip(uniq.keys(), thumbs)}
+                # Same models, but for a REAL animation this time — if the
+                # model document turns out to be TGS (gzip-compressed Lottie,
+                # Telegram's own animated-sticker format), this gives a genuine
+                # Telegram-sourced animation instead of the Fragment-CDN guess,
+                # which is what actually fixes "new collection shows a static
+                # image" rather than just fixing the image itself.
+                anims = await asyncio.gather(*[_doc_anim_json(d) for d in uniq.values()], return_exceptions=True)
+                anim_by_docid = {did: (did if isinstance(a, bytes) else None) for did, a in zip(uniq.keys(), anims)}
+                for item in results:
+                    doc = native_docs.get(item["id"])
+                    if doc is None:
+                        continue
+                    did = getattr(doc, "id", None)
+                    # Fragment-first, ours as fallback: item["image"]/["animation"]
+                    # (the Fragment-CDN guess from serialize_unique) stay as the
+                    # PRIMARY source, since once Fragment has properly crawled
+                    # and composited a collection (backdrop + symbol + model all
+                    # baked in), that's a better result than our bare model-only
+                    # render. The frontend tries Fragment first and only falls
+                    # back to these fields if that 404s — which also means the
+                    # moment Fragment catches up, results switch over
+                    # automatically on the next load, with no extra code needed.
+                    uri = by_docid.get(did)
+                    if uri:
+                        item["imageFallback"] = uri
+                    anim_did = anim_by_docid.get(did)
+                    if anim_did is not None:
+                        item["animationFallback"] = f"{BACKEND_PUBLIC_URL}/api/model-anim/{anim_did}"
+            # Symbol pattern overlay: Telegram's bare model document is only the
+            # character shape — no backdrop colour, no symbol pattern, unlike
+            # Fragment's pre-composited image. We already have the backdrop
+            # colour (backdropHex). This adds the symbol layer too, reusing the
+            # collection's ALREADY-cached attribute thumbnails (no new MTProto
+            # calls, safe even under flood pressure) — every listing just looks
+            # up its own symbol name against that cached list.
+            if results:
+                try:
+                    attrs_payload, _ts = _attrs_db_get(gift_id)
+                    symbol_img_by_name = {}
+                    if attrs_payload and isinstance(attrs_payload, dict):
+                        for s in (attrs_payload.get("resp") or {}).get("symbols") or []:
+                            if s.get("name") and s.get("img"):
+                                symbol_img_by_name[s["name"]] = s["img"]
+                    if symbol_img_by_name:
+                        for item in results:
+                            sym_name = item.get("symbol")
+                            if sym_name and sym_name in symbol_img_by_name:
+                                item["symbolImage"] = symbol_img_by_name[sym_name]
+                except Exception as e:
+                    log.info("symbol overlay lookup skipped: %s", e)
         except FloodWaitError:
             # Telegram is rate-limiting us right now. Don't abort the whole
             # search — Fragment/MarketApp tasks are already in flight and their
@@ -4968,7 +5311,21 @@ async def affiliate_withdraw(payload: dict = Body(...), x_init_data: str = Heade
     s = _affiliate_stats(uid)
     if s["available"] < AFFILIATE_MIN_WITHDRAW:
         return {"ok": False, "error": "min", "available": s["available"], "min": AFFILIATE_MIN_WITHDRAW}
-    stars = s["available"]
+    # Optional custom amount (the member can withdraw less than everything they
+    # have available). Falls back to the full available balance if omitted, so
+    # older clients keep working unchanged.
+    raw_amount = payload.get("amount")
+    if raw_amount is not None:
+        try:
+            stars = int(raw_amount)
+        except Exception:
+            return {"ok": False, "error": "amount"}
+        if stars < AFFILIATE_MIN_WITHDRAW:
+            return {"ok": False, "error": "min", "available": s["available"], "min": AFFILIATE_MIN_WITHDRAW}
+        if stars > s["available"]:
+            return {"ok": False, "error": "amount", "available": s["available"]}
+    else:
+        stars = s["available"]
     pid = _affiliate_request_payout(uid, stars, addr)
     if not pid:
         return {"ok": False, "error": "failed"}
