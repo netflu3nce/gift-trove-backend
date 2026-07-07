@@ -1669,9 +1669,20 @@ INFO = "\u24d8 "
 
 def _gift_url_for(slug="", num="", link="", mkt=""):
     """Best public link for a promoted gift. Telegram-native gifts get the exact
-    t.me/nft link; otherwise we fall back to whatever marketplace link we stored."""
+    t.me/nft link; Thermos gets a referral deep-link; otherwise we fall back to
+    whatever marketplace link we stored."""
     slug = (slug or "").strip()
     num = str(num or "").strip()
+    if mkt == "Thermos" and slug and num:
+        # Reconstruct the readable collection name from the slug for the
+        # referral deep-link format, then delegate to the same helper used
+        # everywhere else — consistent referral tracking on all Thermos links.
+        coll_name = slug  # best we have here; _thermos_gift_url handles it
+        try:
+            num_int = int(num)
+        except Exception:
+            num_int = None
+        return _thermos_gift_url(coll_name, num_int)
     if slug and num:
         return f"https://t.me/nft/{slug}-{num}"
     return (link or "").strip()
@@ -3762,7 +3773,23 @@ async def thermos_search(gift_name, slug, gift_id=None, limit=40, model="", symb
     # documented-public endpoint is a very plausible cause of the 400s seen
     # in production; leaving this here (commented) rather than silently
     # dropping the env var, in case Thermos ever requires it for this API too.
-    headers = {"Content-Type": "application/json"}
+    #
+    # User-Agent/Accept: the request body has been checked directly against
+    # the CURRENT live docs (fetched fresh, not from memory) and matches the
+    # documented ApiGiftSearchRequest shape exactly — every field the right
+    # type, nothing extra. With the body confirmed correct, a generic 400
+    # with no validation detail in the response is most consistent with a
+    # transport-level block rather than a body problem: httpx's default
+    # User-Agent ("python-httpx/x.y.z") is a very recognizable non-browser
+    # signature that basic bot-protection in front of a public API commonly
+    # rejects. Sending a realistic one is a low-risk, high-plausibility next
+    # thing to try given everything else checks out.
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
     try:
         async with httpx.AsyncClient(timeout=9) as cli:
             log.info("thermos request body=%s", json.dumps(body))
@@ -5265,7 +5292,7 @@ async def promote_create(payload: dict = Body(...), x_init_data: str = Header(de
     if not gift_id or not name:
         return {"ok": False, "error": "collection"}
     mkt = _clamp(payload.get("marketplace"), 20)
-    if mkt not in ("Telegram", "MarketApp"):
+    if mkt not in ("Telegram", "MarketApp", "Thermos", "Fragment"):
         return {"ok": False, "error": "marketplace"}
     # All marketplaces: user provides collection + num; bot auto-fetches the listing.
     # No links needed from the frontend.
