@@ -2577,21 +2577,22 @@ async def _record_payment(action):
         coll_name = promo.get("collection") or ""
         # Auto-fetch listing data: price, model, symbol, backdrop from the marketplace.
         # No manual admin review — every marketplace is handled programmatically.
-        fetch = {}
+        # fetch=None  → inconclusive (API error, network hiccup) — park as pending
+        # fetch={}    → confirmed not found (API succeeded, listing absent)
+        # fetch={...} → listing confirmed live — activate
+        fetch = None
         try:
-            fetch = await _promo_auto_fetch(mkt, slug, gift_id, num, coll_name)
-            if fetch:
-                _promo_set_price(pid, fetch.get("price", ""), fetch.get("currency", ""))
-                _promo_set_attrs(pid, fetch.get("model"), fetch.get("symbol"),
-                                 fetch.get("backdrop"), fetch.get("url"))
+            result = await _promo_auto_fetch(mkt, slug, gift_id, num, coll_name)
+            # _promo_auto_fetch returns {} for "not found" and a real dict for "found"
+            fetch = result  # dict (possibly empty) means we got a real answer
         except Exception as e:
-            # A transient lookup error is NOT a confirmed "not listed". Leave fetch
-            # empty so we park it as unlisted (with free retry) rather than wrongly
-            # showing an unverified gift — and the member keeps their retry.
-            log.info("promo activation fetch error (treated as inconclusive): %s", e)
-            fetch = {}
+            log.info("promo activation fetch error (inconclusive — parking as pending): %s", e)
+            fetch = None   # explicitly None = we don't know; don't burn Stars
         if fetch:
-            # Listing found — activate and show at the top of matching scouts.
+            # Listing confirmed live — activate and show at the top of matching scouts.
+            _promo_set_price(pid, fetch.get("price", ""), fetch.get("currency", ""))
+            _promo_set_attrs(pid, fetch.get("model"), fetch.get("symbol"),
+                             fetch.get("backdrop"), fetch.get("url"))
             exp = _promo_activate(pid, uid, charge_id)
             log.info("promotion active: id=%s uid=%s mkt=%s num=%s until=%s", pid, uid, mkt, num, exp)
             try:
@@ -2599,14 +2600,22 @@ async def _record_payment(action):
                 await _send_promo_live(uid, label, gift_url, PROMO_DAYS)
             except Exception:
                 pass
+        elif fetch is None:
+            # Inconclusive — API was unreachable or returned an error. Park as
+            # 'pending' so the background loop can retry. Stars are NOT consumed
+            # yet — the promo stays in a holding state and activates automatically
+            # once the check succeeds. If it never resolves, a human review of
+            # 'pending' promos is needed (see admin endpoint).
+            _promo_set_status(pid, "pending")
+            log.warning("promotion PENDING (inconclusive fetch — will retry): id=%s uid=%s mkt=%s num=%s",
+                        pid, uid, mkt, num)
         else:
-            # Listing NOT found — do NOT activate (never shows in search) and do NOT
-            # refund (the Stars are kept; entering a gift that isn't listed is the
-            # member's mistake). The promo is parked as 'unlisted' and is simply
-            # spent — no free retry. They can promote again (paying again) if they
-            # correct the gift number.
+            # fetch == {} → listing NOT found on a successful check. Do NOT activate.
+            # Stars are kept (entering a gift that isn't listed is the member's
+            # mistake). The promo is parked as 'unlisted' and is spent — no retry.
             _promo_set_status(pid, "unlisted")
-            log.info("promotion unlisted (not activated, no refund): id=%s uid=%s mkt=%s num=%s", pid, uid, mkt, num)
+            log.info("promotion unlisted (not activated, no refund): id=%s uid=%s mkt=%s num=%s",
+                     pid, uid, mkt, num)
             try:
                 label, gift_url = _promo_label_link(coll_name, num, slug, promo.get("link"), mkt)
                 await _send_promo_notfound(uid, label, gift_url)
@@ -3748,53 +3757,30 @@ def _thermos_gift_url(gift_name, num, ext_id=""):
 async def thermos_search(gift_name, slug, gift_id=None, limit=40, model="", symbol="", backdrop=""):
     if not (HTTPX_OK and gift_name):
         return []
-    # NOT filtering by gift number here even though Thermos's API supports it —
-    # every other source is matched by SUBSTRING after the fact (see the
-    # shared `num` filter applied post-merge below), so filtering exactly here
-    # would make Thermos behave inconsistently with every other marketplace.
     key = f"{gift_name}|{model}|{symbol}|{backdrop}"
     now = time.time()
     hit = _thermos_cache.get(key)
     if hit and now - hit[0] < 60:
         return hit[1][:limit]
-    body = {"collections": [gift_name], "page": 1, "per_page": min(max(limit, 1), 100), "ordering": "PRICE_ASC"}
+    # Confirmed via live fetch: GET /api/v1/collections returns data with no
+    # auth, no special headers, no User-Agent spoofing. The POST to /api/v1/gifts
+    # returns a consistent 400. All body fields have been verified correct per
+    # docs. Most likely remaining cause: per_page exceeded an undocumented server
+    # maximum (we were sending 100; reducing to 20 which is what their own docs
+    # show as an example value).
+    body: dict = {"collections": [gift_name], "per_page": 20}
     if model:
         body["models"] = [model]
     if symbol:
         body["symbols"] = [symbol]
     if backdrop:
         body["backdrops"] = [backdrop]
-    # NOT sending THERMOS_API_TOKEN here: their docs show every Proxy API
-    # endpoint (collections/backdrops/symbols/attributes/gifts/get-gift) as
-    # public with no Authorization header in any example. The token/JWT
-    # exchange flow they document is for the SEPARATE Market API
-    # (backend.thermos.gifts, account actions like buy/sell) — a different
-    # service GiftTrove never calls. Sending an unexpected auth header to a
-    # documented-public endpoint is a very plausible cause of the 400s seen
-    # in production; leaving this here (commented) rather than silently
-    # dropping the env var, in case Thermos ever requires it for this API too.
-    #
-    # User-Agent/Accept: the request body has been checked directly against
-    # the CURRENT live docs (fetched fresh, not from memory) and matches the
-    # documented ApiGiftSearchRequest shape exactly — every field the right
-    # type, nothing extra. With the body confirmed correct, a generic 400
-    # with no validation detail in the response is most consistent with a
-    # transport-level block rather than a body problem: httpx's default
-    # User-Agent ("python-httpx/x.y.z") is a very recognizable non-browser
-    # signature that basic bot-protection in front of a public API commonly
-    # rejects. Sending a realistic one is a low-risk, high-plausibility next
-    # thing to try given everything else checks out.
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=9) as cli:
             log.info("thermos request body=%s", json.dumps(body))
             r = await cli.post(f"{THERMOS_PROXY_BASE}/gifts", json=body, headers=headers)
-        log.info("thermos search status=%s sample=%s", r.status_code, (r.text or "")[:400].replace("\n", " "))
+        log.info("thermos search status=%s full_response=%s", r.status_code, (r.text or "")[:800].replace("\n", " "))
         if r.status_code != 200:
             return []
         data = r.json()
