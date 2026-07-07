@@ -126,11 +126,17 @@ MARKETAPP_BASE = os.getenv("MARKETAPP_BASE", "https://api.marketapp.org").rstrip
 # read-only aggregator across TONNEL/PORTALS/MRKT with no auth shown in their
 # docs, unlike their separate authenticated Market API (for buy/sell/withdraw
 # actions, which GiftTrove never needs — it only ever displays listings).
-# THERMOS_API_TOKEN is therefore OPTIONAL: sent as a bearer token if set, in
-# case a key is ever required for a higher rate limit, but search works
-# without one per their public docs.
+# THERMOS_API_TOKEN is kept as a defined env var but currently unused in the
+# actual request (see thermos_search) — sending it as a bearer token to a
+# documented-public endpoint looked like the likely cause of a real 400 seen
+# in production.
 THERMOS_API_TOKEN = os.getenv("THERMOS_API_TOKEN", "").strip()
 THERMOS_PROXY_BASE = os.getenv("THERMOS_PROXY_BASE", "https://proxy.thermos.gifts/api/v1").rstrip("/")
+# The referral id from YOUR OWN Thermos share link (the part between "ref_"
+# and "_g_" in a link like https://t.me/thermos/thermos/?startapp=ref_<THIS>_g_...)
+# — every Thermos listing link this backend builds includes it, so referral
+# credit accrues on purchases made through GiftTrove.
+THERMOS_REF_ID = os.getenv("THERMOS_REF_ID", "").strip()
 _KNOWN_FRONTEND_ORIGINS = [
     "https://gift-trove-frontend.vercel.app",  # main/production
     "https://trovebeta.vercel.app",            # beta
@@ -1146,6 +1152,24 @@ async def _promo_auto_fetch(marketplace, slug, gift_id, num, collection_name="")
                     "url":      item.get("url")      or f"https://fragment.com/gift/{fslug}-{num}",
                 }
         log.info("promo_auto_fetch Fragment #%s not found", num_int)
+        return {}
+
+    # ── Thermos (aggregator search — num captured per item, same
+    #    fetch-broadly-then-filter-exact approach as Fragment above) ──────────
+    if marketplace == "Thermos" and slug:
+        listings = await thermos_search(collection_name or slug, slug, gift_id=gift_id, limit=100)
+        for item in listings:
+            if item.get("num") == num_int:
+                log.info("promo_auto_fetch Thermos found #%s", num_int)
+                return {
+                    "price":    str(item.get("price", "")) if item.get("price") is not None else "",
+                    "currency": item.get("currency", "GRAM"),
+                    "model":    item.get("model")    or "",
+                    "symbol":   item.get("symbol")   or "",
+                    "backdrop": item.get("backdrop") or "",
+                    "url":      item.get("url")      or _thermos_gift_url(collection_name or slug, num_int),
+                }
+        log.info("promo_auto_fetch Thermos #%s not found", num_int)
         return {}
 
     # ── MarketApp (item_num_from / item_num_to exact filter) ──────────────────
@@ -2723,6 +2747,40 @@ async def _connect_user_session():
         return False
 
 
+_consecutive_mtproto_failures = 0
+
+async def _hard_reset_client():
+    """Full teardown + recreation of the MTProto client OBJECT itself — not
+    just disconnect()/connect() on the same object.
+
+    Observed in production: Telethon's own internal 'am I connected'
+    bookkeeping can get stuck desynced from the actual socket state — its own
+    logs showed "Not disconnecting (already have no connection)" immediately
+    followed by "User is already connected!" on the very next attempt, over
+    and over, for many minutes straight, with every single real RPC call
+    timing out the whole time. is_connected() kept reporting a state that
+    didn't reflect reality, so disconnect()+connect() on that SAME object just
+    repeated the same broken cycle — it was asking the confused object to fix
+    itself using the same confused bookkeeping.
+
+    A brand new TelegramClient has none of that stale internal state to be
+    stuck in. This is deliberately NOT the first thing tried on every failure
+    (that would be wasteful for an ordinary one-off hiccup) — see the
+    consecutive-failure counter in _invoke, which only escalates to this
+    after the cheap same-object retry has clearly stopped working."""
+    global client, _consecutive_mtproto_failures
+    log.warning("MTProto: hard-resetting client after repeated consecutive failures")
+    old = client
+    client = None
+    try:
+        if old is not None:
+            await asyncio.wait_for(old.disconnect(), timeout=10)
+    except Exception:
+        pass
+    _consecutive_mtproto_failures = 0
+    await _connect_user_session()
+
+
 async def background_telethon_initializer():
     """Connect Telethon in the background (so Uvicorn binds the port instantly),
     then keep the connection warm with a keepalive loop."""
@@ -2809,12 +2867,7 @@ async def background_telethon_initializer():
             log.warning("keepalive: connection looked dead (%s) — reconnecting", e)
             _session.verified = False
             try:
-                if client is not None:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                await _connect_user_session()
+                await _hard_reset_client()
             except Exception as e2:
                 log.error("keepalive reconnect failed: %s", e2)
         # keep featured fresh (cache TTL is 600s; refresh a bit before it lapses)
@@ -2902,6 +2955,7 @@ async def _invoke(build, timeout=None):
     `build` is a zero-arg callable returning a FRESH request object (so we can
     safely re-send it after a reconnect). Never hangs the worker.
     """
+    global _consecutive_mtproto_failures
     if client is None:
         raise RuntimeError("MTProto client not initialised yet")
     timeout = timeout or MTPROTO_TIMEOUT
@@ -2913,6 +2967,7 @@ async def _invoke(build, timeout=None):
                     await asyncio.wait_for(client.connect(), timeout=15)
                 result = await asyncio.wait_for(client(build()), timeout=timeout)
                 _session.verified = True
+                _consecutive_mtproto_failures = 0
                 return result
             except FloodWaitError as e:
                 # Rate-limited by Telegram. Reconnecting won't help — bail out
@@ -2923,8 +2978,19 @@ async def _invoke(build, timeout=None):
             except Exception as e:
                 last = e
                 _session.verified = False
-                log.error("MTProto invoke attempt %d failed: %s: %r", attempt, type(e).__name__, e)
-                if attempt == 1:
+                _consecutive_mtproto_failures += 1
+                log.error("MTProto invoke attempt %d failed: %s: %r (consecutive failures: %d)",
+                          attempt, type(e).__name__, e, _consecutive_mtproto_failures)
+                # Escalate to a full client rebuild once the cheap same-object
+                # retry has clearly stopped working (see _hard_reset_client for
+                # why this is necessary rather than just trying harder with
+                # the same object). Threshold of 4 is roughly "two full
+                # _invoke calls' worth of attempts", so a single unlucky call
+                # doesn't trigger a rebuild, but a genuinely stuck connection
+                # gets caught within well under a minute.
+                if _consecutive_mtproto_failures >= 4:
+                    await _hard_reset_client()
+                elif attempt == 1:
                     try:
                         await client.disconnect()
                     except Exception:
@@ -3648,14 +3714,24 @@ def _thermos_item(raw, gift_name, slug, gift_id=None):
         "backdrop": backdrop, "backdropRarity": backdrop_rarity,
         "backdropHex": _backdrop_hex_lookup(gift_id, backdrop),
         "market": "Thermos",
-        # NOTE: Thermos's docs don't show a public web/deep-link URL format
-        # for an individual listing (only their bot @thermos and API
-        # endpoints) — this is a best-effort guess and should be confirmed/
-        # corrected once this is live, same as the other fields below that
-        # rely on their documented response shape rather than a live test.
-        "url": f"https://t.me/thermos?startapp=gift_{ext_id}" if ext_id else "https://t.me/thermos",
+        "url": _thermos_gift_url(gift_name, num, ext_id),
         "image": raw.get("image_url"), "animation": raw.get("lottie_url"),
     }
+
+
+def _thermos_gift_url(gift_name, num, ext_id=""):
+    """Deep link to a specific gift through YOUR OWN referral link, so
+    purchases made via GiftTrove credit back to the referrer account.
+    Format confirmed directly from a real share link:
+      https://t.me/thermos/thermos/?startapp=ref_<REF_ID>_g_<Collection_Name>-<number>
+    Falls back to a plain (non-deep) link if the referral id or the specific
+    gift number isn't available, rather than building a malformed deep link."""
+    if THERMOS_REF_ID and num is not None and gift_name:
+        collection_slug = "_".join(str(gift_name).split())
+        return f"https://t.me/thermos/thermos/?startapp=ref_{THERMOS_REF_ID}_g_{collection_slug}-{num}"
+    if THERMOS_REF_ID:
+        return f"https://t.me/thermos/thermos/?startapp=ref_{THERMOS_REF_ID}"
+    return "https://t.me/thermos"
 
 
 async def thermos_search(gift_name, slug, gift_id=None, limit=40, model="", symbol="", backdrop=""):
@@ -3670,18 +3746,26 @@ async def thermos_search(gift_name, slug, gift_id=None, limit=40, model="", symb
     hit = _thermos_cache.get(key)
     if hit and now - hit[0] < 60:
         return hit[1][:limit]
-    body = {"collections": [gift_name], "per_page": min(max(limit, 1), 100), "ordering": "PRICE_ASC"}
+    body = {"collections": [gift_name], "page": 1, "per_page": min(max(limit, 1), 100), "ordering": "PRICE_ASC"}
     if model:
         body["models"] = [model]
     if symbol:
         body["symbols"] = [symbol]
     if backdrop:
         body["backdrops"] = [backdrop]
+    # NOT sending THERMOS_API_TOKEN here: their docs show every Proxy API
+    # endpoint (collections/backdrops/symbols/attributes/gifts/get-gift) as
+    # public with no Authorization header in any example. The token/JWT
+    # exchange flow they document is for the SEPARATE Market API
+    # (backend.thermos.gifts, account actions like buy/sell) — a different
+    # service GiftTrove never calls. Sending an unexpected auth header to a
+    # documented-public endpoint is a very plausible cause of the 400s seen
+    # in production; leaving this here (commented) rather than silently
+    # dropping the env var, in case Thermos ever requires it for this API too.
     headers = {"Content-Type": "application/json"}
-    if THERMOS_API_TOKEN:
-        headers["Authorization"] = f"Bearer {THERMOS_API_TOKEN}"
     try:
         async with httpx.AsyncClient(timeout=9) as cli:
+            log.info("thermos request body=%s", json.dumps(body))
             r = await cli.post(f"{THERMOS_PROXY_BASE}/gifts", json=body, headers=headers)
         log.info("thermos search status=%s sample=%s", r.status_code, (r.text or "")[:400].replace("\n", " "))
         if r.status_code != 200:
