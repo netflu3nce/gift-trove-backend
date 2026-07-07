@@ -163,9 +163,17 @@ PROMO_DAYS  = int(os.getenv("PROMO_DAYS", "3"))     # how long a promotion runs
 PROMO_MAX_SHOWN = int(os.getenv("PROMO_MAX_SHOWN", "3"))         # promoted slots per search
 PROMO_REPORT_HIDE = int(os.getenv("PROMO_REPORT_HIDE", "5"))     # auto-hide after N reports
 
-# ─── Affiliate program (Scout Pro only) ─────────────────────────────────────────
-# A Pro member earns a recurring cut of every subscription payment made by users
-# they referred — but ONLY while the referrer is themselves an active Pro.
+# ─── Affiliate program ───────────────────────────────────────────────────────
+# Any referrer earns a recurring 30% cut of every subscription PAYMENT made by
+# users they referred — Plus or Pro, same rate, every renewal, for as long as
+# that referral keeps paying — PROVIDED the referrer is a CURRENT Pro at the
+# moment of that payment (see the credit call site for the full rationale).
+# If a referrer's Pro lapses, new earning simply stops; it resumes
+# automatically the instant they resubscribe, since the check runs live on
+# every payment rather than needing a separate trigger. Existing balance is
+# never touched by a lapse — only future accrual pauses. Dashboard *access*
+# is a further, separate check (see is_pro in /api/affiliate), applied at
+# view-time with the same current-Pro requirement.
 AFFILIATE_PCT = int(os.getenv("AFFILIATE_PCT", "30"))            # % of each sub payment
 AFFILIATE_MIN_WITHDRAW = int(os.getenv("AFFILIATE_MIN_WITHDRAW", "1000"))  # Stars before payout
 STAR_TO_TON = float(os.getenv("STAR_TO_TON", "0.005"))           # fallback only; live rate preferred
@@ -385,6 +393,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WELCOME_IMAGE = os.getenv("WELCOME_IMAGE", "https://i.ibb.co/ksyP8tjh/Gift-Trove-Telegram-Gifts-Landing-1.png")
 # Banner attached to every shared-gift inline message.
 SHARE_IMAGE = os.getenv("SHARE_IMAGE", "https://i.ibb.co/4g4s6vxj/6-EC6-BD64-4686-4115-A8-A5-CE9-E12-F65-C8-B.png")
+# Bot DM illustrations for three notification moments:
+IMG_CREDIT_SUCCESS = os.getenv("IMG_CREDIT_SUCCESS", "https://i.ibb.co/RpV8YBHH/Gift-Trove-Telegram-Gifts-Landing.png")   # payout credited
+IMG_DECLINED_ENDED = os.getenv("IMG_DECLINED_ENDED", "https://i.ibb.co/Q7VyKBK0/Gift-Trove-Telegram-Gifts-Landing.png")   # payout declined / promo ended unsold
+IMG_PURCHASE_UPGRADE = os.getenv("IMG_PURCHASE_UPGRADE", "https://i.ibb.co/5gtDxJ66/Gift-Trove-Telegram-Gifts-Landing.png")  # promo bought / premium upgrade
 
 # Premium custom-emoji ids (rendered in the bot's own messages via HTML).
 EMOJI_USER = "5974038293120027938"     # 👤  (start, spot 1)
@@ -558,6 +570,21 @@ def init_db():
             """CREATE TABLE IF NOT EXISTS attrs_cache (
                    gift_id TEXT PRIMARY KEY,
                    payload TEXT NOT NULL,
+                   ts INTEGER NOT NULL)"""
+        )
+        # Durable model-animation cache (decompressed Lottie JSON, keyed by the
+        # model document's own id) — thumbnails survive a Render restart via
+        # attrs_cache above, but animations were previously ONLY held in an
+        # in-memory dict, wiped clean on every restart. On a free tier prone
+        # to cold starts, that meant "correct static image, but the animation
+        # never comes back" until the warm loop happened to re-fetch it —
+        # exactly the intermittent stagnant-PNG pattern reported. Keyed
+        # separately from attrs_cache (per-model, not per-collection) since a
+        # collection's full animation set can be large.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS anim_cache (
+                   doc_id TEXT PRIMARY KEY,
+                   data TEXT NOT NULL,
                    ts INTEGER NOT NULL)"""
         )
         # Lightweight event log (rollups are derived from this).
@@ -1282,6 +1309,17 @@ def _affiliate_credit(referrer, referee, tier, stars, charge_id):
         return
     try:
         with db() as conn:
+            # Idempotency: a duplicate webhook delivery for the SAME charge
+            # must never double-credit the referrer. charge_id is the only
+            # thing tying this back to one real payment event.
+            if charge_id:
+                existing = conn.execute(
+                    "SELECT 1 FROM affiliate_earnings WHERE charge_id=? AND referrer=? LIMIT 1",
+                    (str(charge_id), str(referrer))
+                ).fetchone()
+                if existing:
+                    log.info("affiliate credit skipped: charge_id=%s already credited to referrer=%s", charge_id, referrer)
+                    return
             conn.execute(
                 "INSERT INTO affiliate_earnings(id, referrer, referee, tier, stars, charge_id, ts) VALUES(?,?,?,?,?,?,?)",
                 (_secrets.token_hex(8), str(referrer), str(referee), tier or "", int(stars), charge_id or "", int(time.time())))
@@ -2455,7 +2493,18 @@ async def _record_payment(action):
             asyncio.create_task(_set_member_tag(uid, tier))
         except Exception:
             pass
-        # Affiliate: pay the referrer a recurring cut — but only while THEY are Pro.
+        # Affiliate: pay the referrer a recurring cut of EVERY payment their
+        # referral makes, PROVIDED the referrer is a CURRENT Pro at the moment
+        # of that payment. This is a deliberate correction of an earlier
+        # design: earning is now gated on being an active Pro right now, not
+        # on the historical referral relationship alone. If a referrer's Pro
+        # lapses, earning simply stops accruing (their existing balance isn't
+        # touched, but no NEW credit comes in) — and the moment they
+        # resubscribe, earning resumes automatically, since this check runs
+        # live on every payment event rather than needing a separate
+        # "resume" trigger. Dashboard *access* is a further, separate check
+        # (see is_pro in /api/affiliate) — same current-Pro requirement,
+        # applied at view-time instead of earn-time.
         try:
             ref = _referrer_of(uid)
             if ref and str(ref) != str(uid) and get_tier(ref) == "pro":
@@ -2529,7 +2578,7 @@ async def _send_sub_confirmation(uid, tier, switched_from=""):
     switching plans auto-cancels the previous tier, so there's nothing to do."""
     lang = _user_lang(uid)
     msg = INFO + _t("sub_pro" if tier == "pro" else "sub_plus", lang)
-    await _dm(uid, msg)
+    await _dm_photo(uid, IMG_PURCHASE_UPGRADE, msg)
 
 
 async def _send_sub_renewed(uid, tier):
@@ -2567,19 +2616,19 @@ async def _send_promo_live(uid, label, url, days):
 async def _send_promo_notfound(uid, label, url):
     msg = INFO + _t("promo_notfound", _user_lang(uid)).format(label=label)
     links = [(len(INFO), len(label), url)] if url else None
-    await _dm(uid, msg, link_ranges=links)
+    await _dm_photo(uid, IMG_DECLINED_ENDED, msg, link_ranges=links)
 
 
 async def _send_promo_bought(uid, label, url):
     msg = INFO + _t("promo_bought", _user_lang(uid)).format(label=label)
     links = [(len(INFO), len(label), url)] if url else None
-    await _dm(uid, msg, link_ranges=links)
+    await _dm_photo(uid, IMG_PURCHASE_UPGRADE, msg, link_ranges=links)
 
 
 async def _send_promo_ended(uid, label, url):
     msg = INFO + _t("promo_ended", _user_lang(uid)).format(label=label)
     links = [(len(INFO), len(label), url)] if url else None
-    await _dm(uid, msg, link_ranges=links)
+    await _dm_photo(uid, IMG_DECLINED_ENDED, msg, link_ranges=links)
 
 
 # ─── Affiliate payout DMs + admin review ─────────────────────────────────────
@@ -2595,15 +2644,13 @@ async def _send_payout_credited(uid, stars, addr):
     gram = await _fmt_gram(stars)
     when = time.strftime("%b %d, %Y \u00b7 %H:%M UTC", time.gmtime())
     msg = INFO + _t("payout_credited", _user_lang(uid)).format(gram=gram, addr=addr, when=when)
-    start = msg.find(addr) if addr else -1
-    code = [(start, len(addr))] if (addr and start >= 0) else None
-    await _dm(uid, msg, code_ranges=code)
+    await _dm_photo(uid, IMG_CREDIT_SUCCESS, msg)
 
 
 async def _send_payout_declined(uid):
     """DM sent when an admin declines a payout (held balance returns to available)."""
     msg = INFO + _t("payout_declined", _user_lang(uid))
-    await _dm(uid, msg)
+    await _dm_photo(uid, IMG_DECLINED_ENDED, msg)
 
 
 async def _notify_admin_payout(payout, stats=None):
@@ -3017,6 +3064,15 @@ async def _doc_anim_json(doc):
     cached = _anim_cache.get(did)
     if cached is not None:
         return cached if cached is not False else None
+    # Durable check BEFORE a live fetch — this is what actually survives a
+    # Render restart. Previously only the in-memory dict was checked, so
+    # every cold start meant every animation had to be re-fetched from
+    # Telegram from scratch before it would show again.
+    db_data, _db_ts = _anim_db_get(did)
+    if db_data:
+        if len(_anim_cache) < 2000:
+            _anim_cache[did] = db_data
+        return db_data
     raw = None
     transient_failure = False
     try:
@@ -3044,6 +3100,7 @@ async def _doc_anim_json(doc):
         return None
     if len(_anim_cache) < 2000:
         _anim_cache[did] = data
+    _anim_db_set(did, data)
     return data
 
 
@@ -3055,6 +3112,12 @@ async def model_anim(doc_id: int):
     a plain fetch(src) on whatever URL is in `animation`, so no frontend
     change was needed to consume this."""
     data = _anim_cache.get(doc_id)
+    if not data or data is False:
+        db_data, _ts = _anim_db_get(doc_id)
+        if db_data:
+            data = db_data
+            if len(_anim_cache) < 2000:
+                _anim_cache[doc_id] = db_data
     if not data or data is False:
         return JSONResponse(status_code=404, content={"error": "not_available"})
     from fastapi.responses import Response
@@ -3927,6 +3990,40 @@ def _idmap_from_jsonable(d):
     return out
 
 
+def _anim_db_get(doc_id):
+    try:
+        with db() as conn:
+            r = conn.execute("SELECT data, ts FROM anim_cache WHERE doc_id=?", (str(doc_id),)).fetchone()
+            if r:
+                return _b64mod.b64decode(r["data"]), int(r["ts"])
+    except Exception as e:
+        log.info("anim db read skipped: %s", e)
+    return None, 0
+
+
+def _anim_db_set(doc_id, data_bytes):
+    try:
+        blob = _b64mod.b64encode(data_bytes).decode()
+        if len(blob) > 2_000_000:   # a couple MB of base64 is already a very large single animation
+            return
+        now = int(time.time())
+        with db() as conn:
+            cur = conn.execute("UPDATE anim_cache SET data=?, ts=? WHERE doc_id=?", (blob, now, str(doc_id)))
+            if not cur.rowcount:
+                conn.execute("INSERT INTO anim_cache(doc_id, data, ts) VALUES(?,?,?) ON CONFLICT DO NOTHING",
+                             (str(doc_id), blob, now))
+            # Bound storage: keep only the 300 most recently used models —
+            # this is per-MODEL, not per-collection, so the cap is higher
+            # than attrs_cache's 40.
+            conn.execute(
+                "DELETE FROM anim_cache WHERE doc_id NOT IN "
+                "(SELECT doc_id FROM anim_cache ORDER BY ts DESC LIMIT 300)"
+            )
+            conn.commit()
+    except Exception as e:
+        log.info("anim db write skipped: %s", e)
+
+
 def _attrs_db_set(gift_id, payload):
     try:
         blob = json.dumps(payload)
@@ -4008,6 +4105,12 @@ async def _fetch_attributes_live(gift_id):
     for j, s in enumerate(symbols):
         v = imgs[len(model_docs) + j]
         s["img"] = v if isinstance(v, str) else None
+    # Also warm the ANIMATION cache for each model here, in the background —
+    # this is what lets live search results become a pure cache-read (never a
+    # fresh MTProto call at search time, see the search loop below). Gentle:
+    # reuses the same pacing as the rest of this warm pass, one collection at
+    # a time, so it doesn't add a new burst source.
+    await asyncio.gather(*[_doc_anim_json(d) for d in model_docs if d is not None], return_exceptions=True)
     _attr_ids_cache[str(gift_id)] = id_map
     result = {"models": models, "symbols": symbols, "backdrops": backdrops}
     key = f"attrs:{gift_id}"
@@ -4392,31 +4495,40 @@ async def search(
             # collection with, say, 30 results across 8 distinct models only
             # costs 8 fetches, not 30 — and _thumb_cache makes every fetch after
             # the very first search of this collection free for everyone.
-            if native_docs and not _session.under_pressure:
-                uniq = {}
-                for doc in native_docs.values():
-                    did = getattr(doc, "id", None)
-                    if did is not None and did not in uniq:
-                        uniq[did] = doc
-                    if len(uniq) >= 10:   # cap worst-case load per search — a
-                        break             # collection's distinct-model count is
-                                          # usually well under this anyway; this
-                                          # just bounds the rare chunky case
-                thumbs = await asyncio.gather(*[_doc_thumb_uri(d) for d in uniq.values()], return_exceptions=True)
-                by_docid = {did: (uri if isinstance(uri, str) else None) for did, uri in zip(uniq.keys(), thumbs)}
-                # Same models, but for a REAL animation this time — if the
-                # model document turns out to be TGS (gzip-compressed Lottie,
-                # Telegram's own animated-sticker format), this gives a genuine
-                # Telegram-sourced animation instead of the Fragment-CDN guess,
-                # which is what actually fixes "new collection shows a static
-                # image" rather than just fixing the image itself.
-                anims = await asyncio.gather(*[_doc_anim_json(d) for d in uniq.values()], return_exceptions=True)
-                anim_by_docid = {did: (did if isinstance(a, bytes) else None) for did, a in zip(uniq.keys(), anims)}
+            if native_docs:
+                # PURE cache reads only — no live MTProto fetch here. Only the
+                # background warm loop (_fetch_attributes_live, which now also
+                # warms animations) ever does a fresh Telegram call for these.
+                # Search used to call _doc_thumb_uri/_doc_anim_json directly,
+                # which would attempt a live fetch on a cache miss — under any
+                # flood pressure that made searches unreliable AND still left
+                # some listings stagnant when the gate skipped it entirely.
+                # A dict lookup can never cause a flood wait, so this is safe
+                # to do unconditionally, every time.
+                #
+                # Animation durable-fallback lookups are batched by UNIQUE doc
+                # id first — a collection can have many listings sharing very
+                # few distinct models, so this keeps it to one DB read per
+                # distinct model rather than one per listing.
+                uniq_dids = {getattr(d, "id", None) for d in native_docs.values()} - {None}
+                anim_by_did = {}
+                for did in uniq_dids:
+                    a = _anim_cache.get(did)
+                    if a is None:
+                        db_data, _ts = _anim_db_get(did)
+                        if db_data:
+                            a = db_data
+                            if len(_anim_cache) < 2000:
+                                _anim_cache[did] = db_data
+                    if isinstance(a, bytes):
+                        anim_by_did[did] = a
                 for item in results:
                     doc = native_docs.get(item["id"])
                     if doc is None:
                         continue
                     did = getattr(doc, "id", None)
+                    if did is None:
+                        continue
                     # Fragment-first, ours as fallback: item["image"]/["animation"]
                     # (the Fragment-CDN guess from serialize_unique) stay as the
                     # PRIMARY source, since once Fragment has properly crawled
@@ -4426,12 +4538,11 @@ async def search(
                     # back to these fields if that 404s — which also means the
                     # moment Fragment catches up, results switch over
                     # automatically on the next load, with no extra code needed.
-                    uri = by_docid.get(did)
-                    if uri:
+                    uri = _thumb_cache.get(did)
+                    if isinstance(uri, str):
                         item["imageFallback"] = uri
-                    anim_did = anim_by_docid.get(did)
-                    if anim_did is not None and BACKEND_PUBLIC_URL:
-                        item["animationFallback"] = f"{BACKEND_PUBLIC_URL}/api/model-anim/{anim_did}"
+                    if did in anim_by_did and BACKEND_PUBLIC_URL:
+                        item["animationFallback"] = f"{BACKEND_PUBLIC_URL}/api/model-anim/{did}"
             # Symbol pattern overlay: Telegram's bare model document is only the
             # character shape — no backdrop colour, no symbol pattern, unlike
             # Fragment's pre-composited image. We already have the backdrop
@@ -5499,6 +5610,36 @@ async def set_userdata(payload: dict = Body(...), x_init_data: str = Header(defa
 #     custom emoji + price, opened in the app via tg.shareMessage(id). ──────────
 def _u16len(s):
     return len(s.encode("utf-16-le")) // 2
+
+
+async def _dm_photo(uid, photo_url, caption, link_ranges=None):
+    """Send a photo (by URL — Telegram fetches it server-side, no upload
+    needed) with a text caption, optionally with tappable text-link entities
+    (same (start, length, url) shape as _dm's link_ranges). Falls back to a
+    plain text DM if the photo send fails for any reason (e.g. the image host
+    is briefly unreachable), so the actual notification is never silently
+    lost over a decorative image."""
+    if not uid:
+        return False
+    try:
+        payload = {"chat_id": int(uid), "photo": photo_url, "caption": str(caption or "")}
+        if link_ranges:
+            txt = str(caption or "")
+            def _u16(s):
+                return len(s.encode("utf-16-le")) // 2
+            entities = []
+            for start, length, url in link_ranges:
+                if start < 0 or length <= 0 or start + length > len(txt) or not url:
+                    continue
+                entities.append({"type": "text_link", "offset": _u16(txt[:start]), "length": _u16(txt[start:start + length]), "url": url})
+            if entities:
+                payload["caption_entities"] = entities
+        res = await _bot_api("sendPhoto", payload)
+        if res and res.get("ok"):
+            return True
+    except Exception as e:
+        log.info("_dm_photo failed, falling back to plain text: %s", e)
+    return await _dm(uid, caption, link_ranges=link_ranges)
 
 
 async def _bot_api(method, payload):
