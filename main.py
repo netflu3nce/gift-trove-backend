@@ -122,6 +122,15 @@ GETGEMS_GRAPHQL = os.getenv("GETGEMS_GRAPHQL", "https://api.getgems.io/graphql")
 # endpoint can be corrected from their Swagger without a code change.
 MARKETAPP_TOKEN = os.getenv("MARKETAPP_TOKEN", "")
 MARKETAPP_BASE = os.getenv("MARKETAPP_BASE", "https://api.marketapp.org").rstrip("/")
+# Thermos — their documented Proxy API (proxy.thermos.gifts) is a public,
+# read-only aggregator across TONNEL/PORTALS/MRKT with no auth shown in their
+# docs, unlike their separate authenticated Market API (for buy/sell/withdraw
+# actions, which GiftTrove never needs — it only ever displays listings).
+# THERMOS_API_TOKEN is therefore OPTIONAL: sent as a bearer token if set, in
+# case a key is ever required for a higher rate limit, but search works
+# without one per their public docs.
+THERMOS_API_TOKEN = os.getenv("THERMOS_API_TOKEN", "").strip()
+THERMOS_PROXY_BASE = os.getenv("THERMOS_PROXY_BASE", "https://proxy.thermos.gifts/api/v1").rstrip("/")
 _KNOWN_FRONTEND_ORIGINS = [
     "https://gift-trove-frontend.vercel.app",  # main/production
     "https://trovebeta.vercel.app",            # beta
@@ -3598,6 +3607,97 @@ async def marketapp_search(slug, gift_name, gift_id=None, limit=40,
         return []
 
 
+# ─── Thermos (Proxy API — public aggregator across TONNEL/PORTALS/MRKT) ──────
+_thermos_cache = {}
+
+def _thermos_item(raw, gift_name, slug, gift_id=None):
+    """Normalize one item from Thermos's /v1/gifts search response into
+    GiftTrove's shared item shape. Their response already gives model/symbol/
+    backdrop as {name, rarity_per_mille} — same permille-of-1000 scale
+    Telegram itself uses, so /10 gives the same percent format as every other
+    source. Price is a plain nanoton string (no per-listing currency field —
+    their docs confirm everything here is TON)."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        price = float(raw.get("price") or 0) / 1e9
+    except Exception:
+        price = None
+    def _attr(key):
+        d = raw.get(key) or {}
+        name = d.get("name") or ""
+        rar = d.get("rarity_per_mille")
+        rar = round(rar / 10, 2) if isinstance(rar, (int, float)) else None
+        return name, rar
+    model, model_rarity = _attr("model")
+    symbol, symbol_rarity = _attr("symbol")
+    backdrop, backdrop_rarity = _attr("backdrop")
+    num = raw.get("number")
+    try:
+        num = int(num) if num is not None else None
+    except Exception:
+        num = None
+    ext_id = str(raw.get("external_id") or "")
+    return {
+        "id": f"thermos-{ext_id}" if ext_id else f"thermos-{slug}-{num}",
+        "name": gift_name,
+        "slug": slug, "num": num,
+        "price": price, "currency": "GRAM", "gram_value": price,
+        "model": model, "modelRarity": model_rarity,
+        "symbol": symbol, "symbolRarity": symbol_rarity,
+        "backdrop": backdrop, "backdropRarity": backdrop_rarity,
+        "backdropHex": _backdrop_hex_lookup(gift_id, backdrop),
+        "market": "Thermos",
+        # NOTE: Thermos's docs don't show a public web/deep-link URL format
+        # for an individual listing (only their bot @thermos and API
+        # endpoints) — this is a best-effort guess and should be confirmed/
+        # corrected once this is live, same as the other fields below that
+        # rely on their documented response shape rather than a live test.
+        "url": f"https://t.me/thermos?startapp=gift_{ext_id}" if ext_id else "https://t.me/thermos",
+        "image": raw.get("image_url"), "animation": raw.get("lottie_url"),
+    }
+
+
+async def thermos_search(gift_name, slug, gift_id=None, limit=40, model="", symbol="", backdrop=""):
+    if not (HTTPX_OK and gift_name):
+        return []
+    # NOT filtering by gift number here even though Thermos's API supports it —
+    # every other source is matched by SUBSTRING after the fact (see the
+    # shared `num` filter applied post-merge below), so filtering exactly here
+    # would make Thermos behave inconsistently with every other marketplace.
+    key = f"{gift_name}|{model}|{symbol}|{backdrop}"
+    now = time.time()
+    hit = _thermos_cache.get(key)
+    if hit and now - hit[0] < 60:
+        return hit[1][:limit]
+    body = {"collections": [gift_name], "per_page": min(max(limit, 1), 100), "ordering": "PRICE_ASC"}
+    if model:
+        body["models"] = [model]
+    if symbol:
+        body["symbols"] = [symbol]
+    if backdrop:
+        body["backdrops"] = [backdrop]
+    headers = {"Content-Type": "application/json"}
+    if THERMOS_API_TOKEN:
+        headers["Authorization"] = f"Bearer {THERMOS_API_TOKEN}"
+    try:
+        async with httpx.AsyncClient(timeout=9) as cli:
+            r = await cli.post(f"{THERMOS_PROXY_BASE}/gifts", json=body, headers=headers)
+        log.info("thermos search status=%s sample=%s", r.status_code, (r.text or "")[:400].replace("\n", " "))
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        rows = (data.get("items") or []) if isinstance(data, dict) else []
+        out = [it for raw in rows for it in [_thermos_item(raw, gift_name, slug, gift_id)] if it]
+        _thermos_cache[key] = (now, out)
+        if len(_thermos_cache) > 300:
+            _thermos_cache.pop(next(iter(_thermos_cache)))
+        return out[:limit]
+    except Exception as e:
+        log.info("thermos search skipped: %s", e)
+        return []
+
+
 # ─── GetGems (OPTIONAL secondary source) ──────────────────────────────────────
 async def getgems_search(gift_name, limit=12, collection_address=None):
     if not (GETGEMS_API_KEY and HTTPX_OK and gift_name):
@@ -4448,6 +4548,11 @@ async def search(
             _src_budget(marketapp_search(
                 slug, gift, gift_id=gift_id, limit=40,
                 model=model, symbol=symbol, backdrop=backdrop), 9, "marketapp")))
+    if gift and not offset and (not want or "Thermos" in want):
+        sec_tasks.append(asyncio.create_task(
+            _src_budget(thermos_search(
+                gift, slug, gift_id=gift_id, limit=40,
+                model=model, symbol=symbol, backdrop=backdrop), 9, "thermos")))
 
     if client is not None and GetResale and gift_id and (not want or "Telegram" in want):
         try:
@@ -4496,23 +4601,26 @@ async def search(
             # costs 8 fetches, not 30 — and _thumb_cache makes every fetch after
             # the very first search of this collection free for everyone.
             if native_docs:
-                # PURE cache reads only — no live MTProto fetch here. Only the
-                # background warm loop (_fetch_attributes_live, which now also
-                # warms animations) ever does a fresh Telegram call for these.
-                # Search used to call _doc_thumb_uri/_doc_anim_json directly,
-                # which would attempt a live fetch on a cache miss — under any
-                # flood pressure that made searches unreliable AND still left
-                # some listings stagnant when the gate skipped it entirely.
-                # A dict lookup can never cause a flood wait, so this is safe
-                # to do unconditionally, every time.
-                #
-                # Animation durable-fallback lookups are batched by UNIQUE doc
-                # id first — a collection can have many listings sharing very
-                # few distinct models, so this keeps it to one DB read per
-                # distinct model rather than one per listing.
-                uniq_dids = {getattr(d, "id", None) for d in native_docs.values()} - {None}
+                uniq = {}
+                for doc in native_docs.values():
+                    did = getattr(doc, "id", None)
+                    if did is not None and did not in uniq:
+                        uniq[did] = doc
+                # Two tiers: pure cache reads for everything (always safe, no
+                # network call, no flood risk), PLUS a small bounded live-fetch
+                # attempt for whatever's still missing — capped at 4 distinct
+                # models and skipped entirely under flood pressure. Pure-cache-
+                # only was too conservative: a brand-new collection with
+                # nothing warmed yet would show NOTHING at all (no poster, no
+                # animation, just the plain backdrop) until the background
+                # loop happened to reach it, which is exactly the regression
+                # reported. This gives a new collection a real shot on its
+                # very first search while keeping the worst case bounded.
+                thumb_by_did = {}
                 anim_by_did = {}
-                for did in uniq_dids:
+                live_slots = 0 if _session.under_pressure else 4
+                for did, doc in uniq.items():
+                    t = _thumb_cache.get(did)
                     a = _anim_cache.get(did)
                     if a is None:
                         db_data, _ts = _anim_db_get(did)
@@ -4520,6 +4628,15 @@ async def search(
                             a = db_data
                             if len(_anim_cache) < 2000:
                                 _anim_cache[did] = db_data
+                    need_live = (t is None or a is None) and live_slots > 0
+                    if need_live:
+                        live_slots -= 1
+                        if t is None:
+                            t = await _doc_thumb_uri(doc)
+                        if a is None:
+                            a = await _doc_anim_json(doc)
+                    if isinstance(t, str):
+                        thumb_by_did[did] = t
                     if isinstance(a, bytes):
                         anim_by_did[did] = a
                 for item in results:
@@ -4538,9 +4655,8 @@ async def search(
                     # back to these fields if that 404s — which also means the
                     # moment Fragment catches up, results switch over
                     # automatically on the next load, with no extra code needed.
-                    uri = _thumb_cache.get(did)
-                    if isinstance(uri, str):
-                        item["imageFallback"] = uri
+                    if did in thumb_by_did:
+                        item["imageFallback"] = thumb_by_did[did]
                     if did in anim_by_did and BACKEND_PUBLIC_URL:
                         item["animationFallback"] = f"{BACKEND_PUBLIC_URL}/api/model-anim/{did}"
             # Symbol pattern overlay: Telegram's bare model document is only the
@@ -4574,8 +4690,9 @@ async def search(
             log.error("native search error: %s", repr(e))
 
     # Collect the parallel marketplace tasks (started before the Telegram
-    # block). Task order — GetGems, Fragment, MarketApp — matches the old
-    # sequential order, so the dedup pass below keeps the same source priority.
+    # block). Task order — GetGems, Fragment, MarketApp, Thermos — matches
+    # the old sequential order, so the dedup pass below keeps the same
+    # source priority.
     # By now they've been running the whole time Telegram was fetching, so in
     # the common case these awaits return instantly.
     for _t in sec_tasks:
