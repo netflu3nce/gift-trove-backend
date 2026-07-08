@@ -439,6 +439,11 @@ WELCOME_PLAIN = (
 )
 MINIAPP_URL = os.getenv("MINIAPP_URL", "https://t.me/gifttrovebot/app")
 COMMUNITY_URL = os.getenv("COMMUNITY_URL", "https://t.me/gifttrove")
+# Official GiftTrove announcement channel — checked on every app launch to
+# decide whether to show the "Join our channel" bottom sheet. Channel ID is
+# stored as an env var so it can be changed without a redeploy.
+CHANNEL_ID = os.getenv("CHANNEL_ID", "-1003990905901")
+CHANNEL_INVITE_URL = os.getenv("CHANNEL_INVITE_URL", "https://t.me/gifttrove")
 # Hoton (cheaper Stars) referral — used in the "insufficient balance" DM and the
 # in-app "Need Stars?" CTA. Keep this in sync with the frontend link.
 HOTON_URL = os.getenv(
@@ -3768,7 +3773,7 @@ async def thermos_search(gift_name, slug, gift_id=None, limit=40, model="", symb
     # docs. Most likely remaining cause: per_page exceeded an undocumented server
     # maximum (we were sending 100; reducing to 20 which is what their own docs
     # show as an example value).
-    body: dict = {"collections": [gift_name], "per_page": 20}
+    body: dict = {"collections": [gift_name], "per_page": 20, "page": 1}
     if model:
         body["models"] = [model]
     if symbol:
@@ -3776,16 +3781,32 @@ async def thermos_search(gift_name, slug, gift_id=None, limit=40, model="", symb
     if backdrop:
         body["backdrops"] = [backdrop]
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    out: list = []
     try:
-        async with httpx.AsyncClient(timeout=9) as cli:
-            log.info("thermos request body=%s", json.dumps(body))
-            r = await cli.post(f"{THERMOS_PROXY_BASE}/gifts", json=body, headers=headers)
-        log.info("thermos search status=%s full_response=%s", r.status_code, (r.text or "")[:800].replace("\n", " "))
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        rows = (data.get("items") or []) if isinstance(data, dict) else []
-        out = [it for raw in rows for it in [_thermos_item(raw, gift_name, slug, gift_id)] if it]
+        page = 1
+        max_pages = 3   # cap at 60 items per search; prevents hammering their API
+        while page <= max_pages:
+            body["page"] = page
+            async with httpx.AsyncClient(timeout=9) as cli:
+                if page == 1:
+                    log.info("thermos request body=%s", json.dumps(body))
+                r = await cli.post(f"{THERMOS_PROXY_BASE}/gifts", json=body, headers=headers)
+            if page == 1:
+                log.info("thermos search status=%s full_response=%s", r.status_code, (r.text or "")[:800].replace("\n", " "))
+            if r.status_code != 200:
+                break
+            data = r.json()
+            rows = (data.get("items") or []) if isinstance(data, dict) else []
+            if not rows:
+                break
+            for raw in rows:
+                item = _thermos_item(raw, gift_name, slug, gift_id)
+                if item:
+                    out.append(item)
+            total_pages = int((data.get("pages") or 1))
+            if page >= total_pages:
+                break
+            page += 1
         _thermos_cache[key] = (now, out)
         if len(_thermos_cache) > 300:
             _thermos_cache.pop(next(iter(_thermos_cache)))
@@ -4915,6 +4936,26 @@ async def gift(request: Request, slug: str = Query(...),
     except Exception as e:
         log.error("gift detail error: %s", e)
         return {"error": str(e)}
+
+
+@app.get("/api/channel_member")
+async def channel_member(uid: str = Query(""), x_init_data: str = Header(default="", alias="X-Init-Data")):
+    """Check whether the calling user is a member of the official GiftTrove channel.
+    Used by the frontend to decide whether to show the 'Join our channel' sheet.
+    Returns {is_member: bool, invite_url: str}."""
+    verified = verify_init_data(x_init_data)
+    eff_uid = verified or _digits(uid)
+    if not eff_uid:
+        return {"is_member": False, "invite_url": CHANNEL_INVITE_URL}
+    try:
+        result = await _tg_api("getChatMember", {"chat_id": CHANNEL_ID, "user_id": int(eff_uid)})
+        status = (result or {}).get("result", {}).get("status", "left")
+        is_member = status in ("creator", "administrator", "member", "restricted")
+        return {"is_member": is_member, "invite_url": CHANNEL_INVITE_URL}
+    except Exception as e:
+        log.info("channel_member check failed: %s", e)
+        # Fail open — don't pester the user with the sheet on every API hiccup
+        return {"is_member": True, "invite_url": CHANNEL_INVITE_URL}
 
 
 @app.get("/api/access")
