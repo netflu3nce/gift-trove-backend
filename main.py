@@ -3759,7 +3759,7 @@ def _thermos_gift_url(gift_name, num, ext_id=""):
     return "https://t.me/thermos"
 
 
-async def thermos_search(gift_name, slug, gift_id=None, limit=40, model="", symbol="", backdrop=""):
+async def thermos_search(gift_name, slug, gift_id=None, limit=100, model="", symbol="", backdrop=""):
     if not (HTTPX_OK and gift_name):
         return []
     key = f"{gift_name}|{model}|{symbol}|{backdrop}"
@@ -3784,7 +3784,7 @@ async def thermos_search(gift_name, slug, gift_id=None, limit=40, model="", symb
     out: list = []
     try:
         page = 1
-        max_pages = 3   # cap at 60 items per search; prevents hammering their API
+        max_pages = 5   # up to 100 items (5 pages × 20); stops early when total_pages is lower
         while page <= max_pages:
             body["page"] = page
             async with httpx.AsyncClient(timeout=9) as cli:
@@ -4669,7 +4669,7 @@ async def search(
     if gift and not offset and (not want or "Thermos" in want):
         sec_tasks.append(asyncio.create_task(
             _src_budget(thermos_search(
-                gift, slug, gift_id=gift_id, limit=40,
+                gift, slug, gift_id=gift_id, limit=100,
                 model=model, symbol=symbol, backdrop=backdrop), 9, "thermos")))
 
     if client is not None and GetResale and gift_id and (not want or "Telegram" in want):
@@ -4948,7 +4948,7 @@ async def channel_member(uid: str = Query(""), x_init_data: str = Header(default
     if not eff_uid:
         return {"is_member": False, "invite_url": CHANNEL_INVITE_URL}
     try:
-        result = await _tg_api("getChatMember", {"chat_id": CHANNEL_ID, "user_id": int(eff_uid)})
+        result = await _bot_api("getChatMember", {"chat_id": CHANNEL_ID, "user_id": int(eff_uid)})
         status = (result or {}).get("result", {}).get("status", "left")
         is_member = status in ("creator", "administrator", "member", "restricted")
         return {"is_member": is_member, "invite_url": CHANNEL_INVITE_URL}
@@ -6068,38 +6068,22 @@ async def share(payload: dict = Body(...), x_init_data: str = Header(default="",
 
     import uuid as _uuid
     _rid = _uuid.uuid4().hex[:32]
-    # Try to reuse a pre-uploaded Telegram file_id (cached_photo) so the banner
-    # is served from Telegram's CDN — eliminates the half-loaded image.
-    # If upload hasn't happened yet, fall back to article (the reliable format)
-    # so shares always work, even on first cold-start call before the banner is
-    # cached. (photo_url requires JPEG; our banner is PNG so that path = 400.)
-    fid = None
-    try:
-        fid = await _ensure_share_photo_fid()
-    except Exception:
-        pass
-    if fid:
-        result = {
-            "type": "cached_photo",
-            "id": _rid,
-            "photo_file_id": fid,
-            "caption": text,
-            "caption_entities": entities,
-        }
-    else:
-        # Article fallback: no image, but shares work cleanly on every cold start.
-        mid_line = f"{market}{(_mid + price) if price else ''}"
-        result = {
-            "type": "article",
-            "id": _rid,
-            "title": title,
-            "description": mid_line,
-            "input_message_content": {
-                "message_text": text,
-                "entities": entities,
-                "link_preview_options": {"is_disabled": True},
-            },
-        }
+    # Always use article (text-only): the gift's own t.me link is wired in as a
+    # hyperlink so Telegram renders the gift's OWN native card when the recipient
+    # opens it. A separate banner image (cached_photo) attached to the share card
+    # showed a generic GiftTrove graphic, not the actual gift — confusing and wrong.
+    mid_line = f"{market}{(_mid + price) if price else ''}"
+    result = {
+        "type": "article",
+        "id": _rid,
+        "title": title,
+        "description": mid_line,
+        "input_message_content": {
+            "message_text": text,
+            "entities": entities,
+            "link_preview_options": {"is_disabled": False, "url": gift_url} if gift_url else {"is_disabled": True},
+        },
+    }
     try:
         resp = await _bot_api("savePreparedInlineMessage", {
             "user_id": int(uid),
