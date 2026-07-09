@@ -3807,13 +3807,19 @@ async def thermos_search(gift_name, slug, gift_id=None, limit=100, model="", sym
             if page >= total_pages:
                 break
             page += 1
+    except Exception as e:
+        # Return whatever we managed to collect before the error/timeout.
+        # Previously this returned [], discarding e.g. 60 items from pages 1-3
+        # when page 4 was still in-flight as the budget expired.
+        if out:
+            log.info("thermos partial fetch (%d items before %s: %s)", len(out), type(e).__name__, e)
+        else:
+            log.info("thermos search failed: %s", e)
+    if out:
         _thermos_cache[key] = (now, out)
         if len(_thermos_cache) > 300:
             _thermos_cache.pop(next(iter(_thermos_cache)))
-        return out[:limit]
-    except Exception as e:
-        log.info("thermos search skipped: %s", e)
-        return []
+    return out[:limit]
 
 
 # ─── GetGems (OPTIONAL secondary source) ──────────────────────────────────────
@@ -4670,7 +4676,7 @@ async def search(
         sec_tasks.append(asyncio.create_task(
             _src_budget(thermos_search(
                 gift, slug, gift_id=gift_id, limit=100,
-                model=model, symbol=symbol, backdrop=backdrop), 9, "thermos")))
+                model=model, symbol=symbol, backdrop=backdrop), 14, "thermos")))
 
     if client is not None and GetResale and gift_id and (not want or "Telegram" in want):
         try:
@@ -4953,8 +4959,11 @@ async def channel_member(uid: str = Query(""), x_init_data: str = Header(default
         is_member = status in ("creator", "administrator", "member", "restricted")
         return {"is_member": is_member, "invite_url": CHANNEL_INVITE_URL}
     except Exception as e:
-        log.info("channel_member check failed: %s", e)
-        # Fail open — don't pester the user with the sheet on every API hiccup
+        # HTTP 400 from getChatMember almost always means the bot is not an
+        # administrator of the channel. Fix: go to the channel settings in
+        # Telegram, add @gifttrovebot as an administrator (read-only is enough).
+        # Until then, we fail open so users don't get pestered on every API hiccup.
+        log.info("channel_member check failed (is bot admin in channel %s?): %s", CHANNEL_ID, e)
         return {"is_member": True, "invite_url": CHANNEL_INVITE_URL}
 
 
